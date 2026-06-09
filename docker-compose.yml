@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -50,6 +48,11 @@ services:
       FRONTEND_ORIGIN: http://localhost:3000
       JWT_SECRET: cty2Q8OYqKOudFx2EaK2C77wV8ADvTKyVF4tt6ybfKc=
       ENCRYPTION_KEY: NWtxjfFwUKLvxId747p6Qx2w4Ycvy5FpQZ+Dt4EmJJM=
+      S3_ENDPOINT: https://s3.betsbola.site
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: n0J3xkNOZxcYelS02fBM
+      S3_SECRET_ACCESS_KEY: 6AJOvZSRv6lCC3rGMwjQIIxZQkMh8W1vk8yS60e1
+      S3_DEFAULT_BUCKET: betsbola
     depends_on:
       postgres:
         condition: service_healthy

@@ -85,10 +85,12 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	collect.Post("/event",      apiKeyAuth, domainCheckMw, collectH.Event)
 	collect.Post("/identify",   apiKeyAuth, domainCheckMw, collectH.Identify)
 	collect.Post("/conversion", apiKeyAuth, domainCheckMw, rulesH.ClientConversion)
+	collect.Post("/heartbeat",  apiKeyAuth, collectH.Heartbeat)
 	collect.Options("/*", func(c *fiber.Ctx) error { return c.SendStatus(204) })
 
 	// ── Trigger Rules (público — lido pelo tracker.js) ────────────────────────
 	app.Get("/v1/rules", middleware.CollectCORS(), apiKeyAuth, rulesH.Public)
+	app.Options("/v1/rules", middleware.CollectCORS(), func(c *fiber.Ctx) error { return c.SendStatus(204) })
 
 	// ── Test Events SSE ───────────────────────────────────────────────────────
 	testEventsH := handlers.NewTestEvents(rawRedis)

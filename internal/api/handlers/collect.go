@@ -1,6 +1,13 @@
 package handlers
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
 	"github.com/ecsistem/convtrack/internal/api/middleware"
 	"github.com/ecsistem/convtrack/internal/attribution"
 	"github.com/ecsistem/convtrack/internal/models"
@@ -24,6 +31,11 @@ type sessionPayload struct {
 	LandingPage string `json:"landing_page"`
 	Referrer    string `json:"referrer"`
 	UserAgent   string `json:"user_agent"`
+	// Device / browser info
+	ScreenWidth  int    `json:"screen_width"`
+	ScreenHeight int    `json:"screen_height"`
+	Timezone     string `json:"timezone"`
+	Language     string `json:"language"`
 	// UTM params
 	UTMSource   string `json:"utm_source"`
 	UTMMedium   string `json:"utm_medium"`
@@ -75,14 +87,22 @@ func (h *CollectHandler) Session(c *fiber.Ctx) error {
 	}
 
 	sess, err := h.sessions.UpsertSession(c.Context(), session.UpsertSessionInput{
-		SessionID:   sessionID,
-		VisitorID:   visitorID,
-		ProjectID:   project.ID,
-		LandingPage: p.LandingPage,
-		Referrer:    p.Referrer,
-		UserAgent:   ua,
-		IP:          ip,
+		SessionID:    sessionID,
+		VisitorID:    visitorID,
+		ProjectID:    project.ID,
+		LandingPage:  p.LandingPage,
+		Referrer:     p.Referrer,
+		UserAgent:    ua,
+		IP:           ip,
+		ScreenWidth:  p.ScreenWidth,
+		ScreenHeight: p.ScreenHeight,
+		Timezone:     p.Timezone,
+		Language:     p.Language,
 	})
+	if err == nil {
+		// Geo lookup assíncrono — não bloqueia a resposta
+		go lookupGeo(sess.ID, ip, h.sessions)
+	}
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "session error"})
 	}
@@ -179,6 +199,69 @@ func (h *CollectHandler) Identify(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"ok": true})
+}
+
+// POST /v1/collect/heartbeat
+// Chamado pelo tracker.js a cada 30s e no beforeunload para manter métricas atualizadas.
+func (h *CollectHandler) Heartbeat(c *fiber.Ctx) error {
+	project := middleware.GetProject(c)
+	if project == nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+
+	var body struct {
+		SessionID       string `json:"session_id"`
+		DurationSeconds int    `json:"duration_seconds"`
+		PageCount       int    `json:"page_count"`
+		CurrentPage     string `json:"current_page"`
+	}
+	if err := c.BodyParser(&body); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+	}
+
+	sessionID, err := uuid.Parse(body.SessionID)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid session_id"})
+	}
+
+	_ = h.sessions.Heartbeat(c.Context(), sessionID, body.DurationSeconds, body.PageCount, body.CurrentPage)
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// lookupGeo faz lookup de IP via ip-api.com e preenche country/city da sessão.
+// Executado em goroutine — falhas são silenciosas.
+func lookupGeo(sessionID uuid.UUID, ip string, svc *session.Service) {
+	// Não faz lookup de IPs privados/loopback
+	if ip == "" || ip == "127.0.0.1" || strings.HasPrefix(ip, "192.168.") ||
+		strings.HasPrefix(ip, "10.") || strings.HasPrefix(ip, "172.") || ip == "::1" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=country,city,status", ip)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Status  string `json:"status"`
+		Country string `json:"country"`
+		City    string `json:"city"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || result.Status != "success" {
+		return
+	}
+
+	_ = svc.UpdateGeo(context.Background(), sessionID, result.Country, result.City)
 }
 
 func parseOrNewUUID(s string) (uuid.UUID, error) {

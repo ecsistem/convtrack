@@ -22,13 +22,10 @@ type S3Client struct {
 }
 
 func NewS3Client(ctx context.Context) (*S3Client, error) {
-	bucket := os.Getenv("S3_BUCKET")
-	if bucket == "" {
-		bucket = "convtrack-replays"
-	}
+	bucket := getEnv("S3_DEFAULT_BUCKET", getEnv("S3_BUCKET", "convtrack-replays"))
 
-	accessKey := os.Getenv("S3_ACCESS_KEY")
-	secretKey  := os.Getenv("S3_SECRET_KEY")
+	accessKey := getEnv("S3_ACCESS_KEY_ID", os.Getenv("S3_ACCESS_KEY"))
+	secretKey  := getEnv("S3_SECRET_ACCESS_KEY", os.Getenv("S3_SECRET_KEY"))
 	region     := getEnv("S3_REGION", "us-east-1")
 
 	opts := []func(*config.LoadOptions) error{

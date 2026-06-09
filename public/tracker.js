@@ -12,7 +12,9 @@
   })();
 
   var apiKey   = script.getAttribute('data-key') || '';
-  var apiBase  = script.getAttribute('data-api') || 'https://api.convtrack.io';
+  var apiBase  = script.getAttribute('data-api') || (function () {
+    try { return new URL(script.src).origin; } catch (e) { return ''; }
+  })();
   var replayOn = script.getAttribute('data-replay') !== 'false';
 
   if (!apiKey) {
@@ -128,17 +130,93 @@
     attr.fbc = 'fb.1.' + Date.now() + '.' + attr.fbclid;
   }
 
+  // ── Device & browser metadata ─────────────────────────────────────────────
+
+  var screenW  = window.screen ? (window.screen.width  || 0) : 0;
+  var screenH  = window.screen ? (window.screen.height || 0) : 0;
+  var timezone = '';
+  try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) {}
+  var language = navigator.language || navigator.userLanguage || '';
+
+  // ── Engagement / duration tracking ───────────────────────────────────────
+
+  var sessionStartTs  = Date.now();
+  var engagedMs       = 0;
+  var engagedStart    = null;  // timestamp when user became active
+  var pageCount       = 1;
+  var currentPage     = window.location.href;
+  var heartbeatTimer  = null;
+  var HEARTBEAT_MS    = 30 * 1000; // 30 segundos
+
+  function isActive() { return document.visibilityState !== 'hidden'; }
+
+  function startEngaged() {
+    if (engagedStart === null && isActive()) engagedStart = Date.now();
+  }
+  function pauseEngaged() {
+    if (engagedStart !== null) {
+      engagedMs  += Date.now() - engagedStart;
+      engagedStart = null;
+    }
+  }
+
+  startEngaged();
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') { pauseEngaged(); } else { startEngaged(); }
+  });
+  window.addEventListener('focus', startEngaged);
+  window.addEventListener('blur',  pauseEngaged);
+
+  function totalDurationSeconds() {
+    return Math.round((Date.now() - sessionStartTs) / 1000);
+  }
+
+  function sendHeartbeat(isFinal) {
+    pauseEngaged();
+    if (isFinal && !isActive()) startEngaged(); // resume tracker before final flush
+    var body = {
+      session_id:       sessionId,
+      duration_seconds: totalDurationSeconds(),
+      page_count:       pageCount,
+      current_page:     currentPage,
+    };
+    if (isFinal && navigator.sendBeacon) {
+      navigator.sendBeacon(
+        apiBase + '/v1/collect/heartbeat',
+        new Blob([JSON.stringify(Object.assign({ api_key: apiKey }, body))], { type: 'application/json' })
+      );
+    } else {
+      send('/v1/collect/heartbeat', body);
+    }
+    if (!isFinal) startEngaged();
+  }
+
+  function scheduleHeartbeat() {
+    clearTimeout(heartbeatTimer);
+    heartbeatTimer = setTimeout(function () {
+      sendHeartbeat(false);
+      scheduleHeartbeat();
+    }, HEARTBEAT_MS);
+  }
+
+  scheduleHeartbeat();
+  window.addEventListener('beforeunload', function () { sendHeartbeat(true); });
+
   // ── Send session to API ───────────────────────────────────────────────────
   // Usa fetch (não sendBeacon) para poder ler a resposta e detectar clone.
 
   function collectSession() {
     var url  = apiBase + '/v1/collect/session';
     var body = JSON.stringify(Object.assign({ api_key: apiKey }, {
-      visitor_id:   visitorId,
-      session_id:   sessionId,
-      landing_page: window.location.href,
-      referrer:     document.referrer,
-      user_agent:   navigator.userAgent,
+      visitor_id:    visitorId,
+      session_id:    sessionId,
+      landing_page:  window.location.href,
+      referrer:      document.referrer,
+      user_agent:    navigator.userAgent,
+      screen_width:  screenW,
+      screen_height: screenH,
+      timezone:      timezone,
+      language:      language,
     }, attr));
 
     fetch(url, {
@@ -150,14 +228,10 @@
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (data) {
         if (data && data.clone_detected && data.redirect_url) {
-          // Este site é um clone — redireciona o visitante para o site original
-          // preservando path e UTMs.
           window.location.replace(data.redirect_url);
         }
       })
-      .catch(function () {
-        // Falha silenciosa — não interrompe a experiência do visitante
-      });
+      .catch(function () {});
   }
 
   collectSession();
@@ -516,9 +590,14 @@
 
     function onNav() {
       if (window.location.pathname !== lastPath) {
-        lastPath = window.location.pathname;
+        lastPath    = window.location.pathname;
+        currentPage = window.location.href;
+        pageCount  += 1;
         store(STORAGE_SESSION + '_ts', String(Date.now()));
         window.ConvTrack.track('pageview', { url: window.location.href });
+        // Envia heartbeat imediato com página atualizada
+        sendHeartbeat(false);
+        scheduleHeartbeat();
       }
     }
 

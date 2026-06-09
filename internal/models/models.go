@@ -36,20 +36,30 @@ type Visitor struct {
 }
 
 type Session struct {
-	ID           uuid.UUID  `json:"id" db:"id"`
-	VisitorID    uuid.UUID  `json:"visitor_id" db:"visitor_id"`
-	ProjectID    uuid.UUID  `json:"project_id" db:"project_id"`
-	StartedAt    time.Time  `json:"started_at" db:"started_at"`
-	LastActivity time.Time  `json:"last_activity" db:"last_activity"`
-	LandingPage  string     `json:"landing_page" db:"landing_page"`
-	Referrer     string     `json:"referrer" db:"referrer"`
-	UserAgent    string     `json:"user_agent" db:"user_agent"`
-	IP           string     `json:"ip" db:"ip"`
-	Country      string     `json:"country" db:"country"`
-	City         string     `json:"city" db:"city"`
-	Device       string     `json:"device" db:"device"`
-	Browser      string     `json:"browser" db:"browser"`
-	OS           string     `json:"os" db:"os"`
+	ID              uuid.UUID  `json:"id" db:"id"`
+	VisitorID       uuid.UUID  `json:"visitor_id" db:"visitor_id"`
+	ProjectID       uuid.UUID  `json:"project_id" db:"project_id"`
+	StartedAt       time.Time  `json:"started_at" db:"started_at"`
+	LastActivity    time.Time  `json:"last_activity" db:"last_activity"`
+	LandingPage     string     `json:"landing_page" db:"landing_page"`
+	Referrer        string     `json:"referrer" db:"referrer"`
+	UserAgent       string     `json:"user_agent" db:"user_agent"`
+	IP              string     `json:"ip" db:"ip"`
+	Country         string     `json:"country" db:"country"`
+	City            string     `json:"city" db:"city"`
+	Device          string     `json:"device" db:"device"`
+	Browser         string     `json:"browser" db:"browser"`
+	OS              string     `json:"os" db:"os"`
+	// Metrics (migration 009)
+	ScreenWidth     int        `json:"screen_width" db:"screen_width"`
+	ScreenHeight    int        `json:"screen_height" db:"screen_height"`
+	Timezone        string     `json:"timezone" db:"timezone"`
+	Language        string     `json:"language" db:"language"`
+	DurationSeconds int        `json:"duration_seconds" db:"duration_seconds"`
+	PageCount       int        `json:"page_count" db:"page_count"`
+	ExitPage        string     `json:"exit_page" db:"exit_page"`
+	// Computed — not stored, filled in dashboard queries
+	TimeToPurchase  *int       `json:"time_to_purchase,omitempty"` // seconds
 }
 
 type Attribution struct {

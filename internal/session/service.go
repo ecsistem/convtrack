@@ -19,18 +19,22 @@ func New(db *pgxpool.Pool) *Service {
 }
 
 type UpsertSessionInput struct {
-	SessionID   uuid.UUID
-	VisitorID   uuid.UUID
-	ProjectID   uuid.UUID
-	LandingPage string
-	Referrer    string
-	UserAgent   string
-	IP          string
-	Country     string
-	City        string
-	Device      string
-	Browser     string
-	OS          string
+	SessionID    uuid.UUID
+	VisitorID    uuid.UUID
+	ProjectID    uuid.UUID
+	LandingPage  string
+	Referrer     string
+	UserAgent    string
+	IP           string
+	Country      string
+	City         string
+	Device       string
+	Browser      string
+	OS           string
+	ScreenWidth  int
+	ScreenHeight int
+	Timezone     string
+	Language     string
 }
 
 type UpsertVisitorInput struct {
@@ -45,7 +49,7 @@ func (s *Service) UpsertVisitor(ctx context.Context, in UpsertVisitorInput) (*mo
 		VALUES (gen_random_uuid(), $1, $2, NOW(), NOW())
 		ON CONFLICT (project_id, fingerprint) DO UPDATE
 			SET last_seen = NOW()
-		RETURNING id, project_id, fingerprint, first_seen, last_seen`,
+		RETURNING id, project_id, COALESCE(fingerprint,''), first_seen, last_seen`,
 		in.ProjectID, in.Fingerprint,
 	).Scan(&v.ID, &v.ProjectID, &v.Fingerprint, &v.FirstSeen, &v.LastSeen)
 	if err != nil {
@@ -57,7 +61,7 @@ func (s *Service) UpsertVisitor(ctx context.Context, in UpsertVisitorInput) (*mo
 func (s *Service) GetOrCreateVisitor(ctx context.Context, projectID, visitorID uuid.UUID) (*models.Visitor, error) {
 	var v models.Visitor
 	err := s.db.QueryRow(ctx,
-		`SELECT id, project_id, fingerprint, first_seen, last_seen FROM visitors WHERE id = $1 AND project_id = $2`,
+		`SELECT id, project_id, COALESCE(fingerprint,''), first_seen, last_seen FROM visitors WHERE id = $1 AND project_id = $2`,
 		visitorID, projectID,
 	).Scan(&v.ID, &v.ProjectID, &v.Fingerprint, &v.FirstSeen, &v.LastSeen)
 	if err == nil {
@@ -70,7 +74,7 @@ func (s *Service) GetOrCreateVisitor(ctx context.Context, projectID, visitorID u
 		INSERT INTO visitors (id, project_id, first_seen, last_seen)
 		VALUES ($1, $2, NOW(), NOW())
 		ON CONFLICT (id) DO UPDATE SET last_seen = NOW()
-		RETURNING id, project_id, fingerprint, first_seen, last_seen`,
+		RETURNING id, project_id, COALESCE(fingerprint,''), first_seen, last_seen`,
 		visitorID, projectID,
 	).Scan(&v.ID, &v.ProjectID, &v.Fingerprint, &v.FirstSeen, &v.LastSeen)
 	return &v, err
@@ -80,23 +84,57 @@ func (s *Service) UpsertSession(ctx context.Context, in UpsertSessionInput) (*mo
 	var sess models.Session
 	err := s.db.QueryRow(ctx, `
 		INSERT INTO sessions (id, visitor_id, project_id, started_at, last_activity,
-			landing_page, referrer, user_agent, ip, country, city, device, browser, os)
-		VALUES ($1, $2, $3, NOW(), NOW(), $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			landing_page, referrer, user_agent, ip, country, city, device, browser, os,
+			screen_width, screen_height, timezone, language)
+		VALUES ($1, $2, $3, NOW(), NOW(), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		ON CONFLICT (id) DO UPDATE
 			SET last_activity = NOW()
 		RETURNING id, visitor_id, project_id, started_at, last_activity,
-			landing_page, referrer, user_agent, ip, country, city, device, browser, os`,
+			landing_page, referrer, user_agent, ip,
+			COALESCE(country,''), COALESCE(city,''),
+			COALESCE(device,''), COALESCE(browser,''), COALESCE(os,''),
+			COALESCE(screen_width,0), COALESCE(screen_height,0),
+			COALESCE(timezone,''), COALESCE(language,''),
+			COALESCE(duration_seconds,0), COALESCE(page_count,1), COALESCE(exit_page,'')`,
 		in.SessionID, in.VisitorID, in.ProjectID,
 		in.LandingPage, in.Referrer, in.UserAgent,
 		in.IP, in.Country, in.City,
 		in.Device, in.Browser, in.OS,
+		in.ScreenWidth, in.ScreenHeight, in.Timezone, in.Language,
 	).Scan(
 		&sess.ID, &sess.VisitorID, &sess.ProjectID, &sess.StartedAt, &sess.LastActivity,
 		&sess.LandingPage, &sess.Referrer, &sess.UserAgent,
 		&sess.IP, &sess.Country, &sess.City,
 		&sess.Device, &sess.Browser, &sess.OS,
+		&sess.ScreenWidth, &sess.ScreenHeight,
+		&sess.Timezone, &sess.Language,
+		&sess.DurationSeconds, &sess.PageCount, &sess.ExitPage,
 	)
 	return &sess, err
+}
+
+// Heartbeat — atualiza duração, página atual e contagem de páginas da sessão.
+// Chamado pelo tracker.js a cada 30 segundos e no beforeunload.
+func (s *Service) Heartbeat(ctx context.Context, sessionID uuid.UUID, durationSeconds, pageCount int, currentPage string) error {
+	_, err := s.db.Exec(ctx, `
+		UPDATE sessions SET
+			last_activity    = NOW(),
+			duration_seconds = GREATEST(duration_seconds, $2),
+			page_count       = GREATEST(page_count, $3),
+			exit_page        = CASE WHEN $4 != '' THEN $4 ELSE exit_page END
+		WHERE id = $1`,
+		sessionID, durationSeconds, pageCount, currentPage,
+	)
+	return err
+}
+
+// UpdateGeo preenche country/city após lookup assíncrono de IP.
+func (s *Service) UpdateGeo(ctx context.Context, sessionID uuid.UUID, country, city string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE sessions SET country = $2, city = $3 WHERE id = $1 AND (country = '' OR country IS NULL)`,
+		sessionID, country, city,
+	)
+	return err
 }
 
 func (s *Service) UpsertAttribution(ctx context.Context, a *models.Attribution) error {
@@ -171,11 +209,21 @@ func (s *Service) FindSessionByEmailHash(ctx context.Context, projectID uuid.UUI
 
 func (s *Service) ListSessions(ctx context.Context, projectID uuid.UUID, limit, offset int) ([]models.Session, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT id, visitor_id, project_id, started_at, last_activity,
-		       landing_page, referrer, user_agent, ip, country, city, device, browser, os
-		FROM sessions
-		WHERE project_id = $1
-		ORDER BY started_at DESC
+		SELECT
+			s.id, s.visitor_id, s.project_id, s.started_at, s.last_activity,
+			s.landing_page, s.referrer, s.user_agent, s.ip,
+			COALESCE(s.country,''), COALESCE(s.city,''),
+			COALESCE(s.device,''), COALESCE(s.browser,''), COALESCE(s.os,''),
+			COALESCE(s.screen_width,0), COALESCE(s.screen_height,0),
+			COALESCE(s.timezone,''), COALESCE(s.language,''),
+			COALESCE(s.duration_seconds,0), COALESCE(s.page_count,1), COALESCE(s.exit_page,''),
+			-- time_to_purchase: seconds between session start and first conversion
+			(SELECT EXTRACT(EPOCH FROM MIN(c.created_at) - s.started_at)::INT
+			 FROM conversions c
+			 WHERE c.session_id = s.id AND c.status = 'approved') AS time_to_purchase
+		FROM sessions s
+		WHERE s.project_id = $1
+		ORDER BY s.started_at DESC
 		LIMIT $2 OFFSET $3`,
 		projectID, limit, offset,
 	)
@@ -186,16 +234,20 @@ func (s *Service) ListSessions(ctx context.Context, projectID uuid.UUID, limit, 
 
 	var sessions []models.Session
 	for rows.Next() {
-		var s models.Session
+		var sess models.Session
 		if err := rows.Scan(
-			&s.ID, &s.VisitorID, &s.ProjectID, &s.StartedAt, &s.LastActivity,
-			&s.LandingPage, &s.Referrer, &s.UserAgent,
-			&s.IP, &s.Country, &s.City,
-			&s.Device, &s.Browser, &s.OS,
+			&sess.ID, &sess.VisitorID, &sess.ProjectID, &sess.StartedAt, &sess.LastActivity,
+			&sess.LandingPage, &sess.Referrer, &sess.UserAgent,
+			&sess.IP, &sess.Country, &sess.City,
+			&sess.Device, &sess.Browser, &sess.OS,
+			&sess.ScreenWidth, &sess.ScreenHeight,
+			&sess.Timezone, &sess.Language,
+			&sess.DurationSeconds, &sess.PageCount, &sess.ExitPage,
+			&sess.TimeToPurchase,
 		); err != nil {
 			return nil, err
 		}
-		sessions = append(sessions, s)
+		sessions = append(sessions, sess)
 	}
 	return sessions, nil
 }

@@ -23,8 +23,10 @@ func DashboardCORS(frontendOrigin string) fiber.Handler {
 	}
 	return cors.New(cors.Config{
 		AllowOrigins:     frontendOrigin,
-		AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders:     "Content-Type, Authorization",
+		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+		AllowHeaders:     "Content-Type, Authorization, X-Project-Id",
+		ExposeHeaders:    "Content-Length",
 		AllowCredentials: true,
+		MaxAge:           86400,
 	})
 }
