@@ -1,0 +1,77 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: convtrack
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql
+      - ./migrations/002_kwai.sql:/docker-entrypoint-initdb.d/002_kwai.sql
+      - ./migrations/003_replay_unique.sql:/docker-entrypoint-initdb.d/003_replay_unique.sql
+      - ./migrations/004_queue_and_security.sql:/docker-entrypoint-initdb.d/004_queue_and_security.sql
+      - ./migrations/005_trigger_rules.sql:/docker-entrypoint-initdb.d/005_trigger_rules.sql
+      - ./migrations/006_analytics.sql:/docker-entrypoint-initdb.d/006_analytics.sql
+      - ./migrations/007_auth.sql:/docker-entrypoint-initdb.d/007_auth.sql
+      - ./migrations/008_clone_protection.sql:/docker-entrypoint-initdb.d/008_clone_protection.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/convtrack?sslmode=disable
+      REDIS_ADDR: redis:6379
+      PORT: 8080
+      FRONTEND_ORIGIN: http://localhost:3000
+      JWT_SECRET: cty2Q8OYqKOudFx2EaK2C77wV8ADvTKyVF4tt6ybfKc=
+      ENCRYPTION_KEY: NWtxjfFwUKLvxId747p6Qx2w4Ycvy5FpQZ+Dt4EmJJM=
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./public:/app/public
+
+  web:
+    build:
+      context: ../convtrack-web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8080
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+      NODE_ENV: production
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  redisdata:
