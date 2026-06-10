@@ -20,6 +20,15 @@ func APIKey(db *pgxpool.Pool, rdb *cache.Cache) fiber.Handler {
 		if apiKey == "" {
 			apiKey = c.Query("api_key")
 		}
+		// sendBeacon não suporta headers customizados — lê do body JSON
+		if apiKey == "" && len(c.Body()) > 0 {
+			var body struct {
+				APIKey string `json:"api_key"`
+			}
+			if json.Unmarshal(c.Body(), &body) == nil {
+				apiKey = body.APIKey
+			}
+		}
 		if apiKey == "" {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing api key"})
 		}

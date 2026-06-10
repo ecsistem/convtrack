@@ -626,25 +626,37 @@
       var FLUSH_MS   = 5000;
 
       function sendBatch(final) {
-        if (replayBatch.length === 0) return;
+        if (replayBatch.length === 0) {
+          // Se não há eventos pendentes mas é final, ainda manda o flush
+          if (!final) return;
+        }
         var toSend = replayBatch.splice(0, replayBatch.length);
-        var endpoint = final ? '/v1/replay/flush' : '/v1/replay/events';
 
-        // sendBeacon para garantir envio no unload
-        var body = JSON.stringify({
-          api_key:    apiKey,
-          session_id: sessionId,
-          trigger:    replayTrigger,
-          events:     final ? undefined : toSend, // flush usa só session_id
-        });
-
-        if (final && navigator.sendBeacon) {
-          navigator.sendBeacon(
-            apiBase + endpoint,
-            new Blob([body], { type: 'application/json' })
-          );
+        if (final) {
+          // Primeiro envia eventos pendentes (se houver), depois sinaliza flush S3
+          if (toSend.length > 0) {
+            send('/v1/replay/events', {
+              session_id: sessionId,
+              trigger:    replayTrigger,
+              events:     toSend,
+            });
+          }
+          // Sinaliza backend para mover Redis → S3 (independente de ter eventos)
+          var flushBody = JSON.stringify({
+            api_key:    apiKey,
+            session_id: sessionId,
+            trigger:    replayTrigger,
+          });
+          if (navigator.sendBeacon) {
+            navigator.sendBeacon(
+              apiBase + '/v1/replay/flush',
+              new Blob([flushBody], { type: 'application/json' })
+            );
+          } else {
+            send('/v1/replay/flush', { session_id: sessionId, trigger: replayTrigger });
+          }
         } else {
-          send(endpoint, {
+          send('/v1/replay/events', {
             session_id: sessionId,
             trigger:    replayTrigger,
             events:     toSend,
@@ -684,9 +696,11 @@
 
       // Flush final quando o usuário sai da página
       window.addEventListener('beforeunload', function () {
-        sendBatch(false); // envia eventos pendentes
-        sendBatch(true);  // sinaliza flush final pro S3
+        sendBatch(true); // envia pendentes + sinaliza flush Redis → S3
       });
+
+      // Expõe flush manual para testes (test.html usa isso)
+      window._ctFlushReplay = function () { sendBatch(true); };
     }
   }
 

@@ -98,10 +98,17 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 
 	// ── Session Replay ───────────────────────────────────────────────────────
 	if replayH != nil {
-		rep := app.Group("/v1/replay", middleware.CollectCORS())
-		rep.Post("/events", apiKeyAuth, replayH.Collect)
-		rep.Post("/flush",  apiKeyAuth, replayH.Flush)
-		rep.Options("/*", func(c *fiber.Ctx) error { return c.SendStatus(204) })
+		collectCORS := middleware.CollectCORS()
+
+		// Collect (API key, CORS aberto — tracker.js)
+		app.Post("/v1/replay/events", collectCORS, apiKeyAuth, replayH.Collect)
+		app.Post("/v1/replay/flush",  collectCORS, apiKeyAuth, replayH.Flush)
+		app.Options("/v1/replay/events", collectCORS, func(c *fiber.Ctx) error { return c.SendStatus(204) })
+		app.Options("/v1/replay/flush",  collectCORS, func(c *fiber.Ctx) error { return c.SendStatus(204) })
+
+		// GET presigned URL — JWT auth, dashboard
+		app.Get("/v1/replay/:sessionId",     dashCORS, jwtAuth, middleware.RequireProject, replayH.GetURL)
+		app.Options("/v1/replay/:sessionId", dashCORS, func(c *fiber.Ctx) error { return c.SendStatus(204) })
 	}
 
 	// ── Webhook endpoints ─────────────────────────────────────────────────────
@@ -148,7 +155,9 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"ok": true})
 	})
-	app.Static("/tracker.js", "./public/tracker.js")
+	app.Static("/tracker.js",   "./public/tracker.js")
+	app.Static("/rrweb.min.js", "./public/rrweb.min.js")
+	app.Static("/test.html",    "./public/test.html")
 
 	return app
 }

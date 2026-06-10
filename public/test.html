@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ConvTrack — Teste de Sessão e Replay</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e5e5e5; padding: 40px 24px; }
+    h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 8px; color: #fff; }
+    p  { font-size: 0.875rem; color: #888; margin-bottom: 32px; }
+    .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; padding: 24px; margin-bottom: 20px; max-width: 520px; }
+    .card h2 { font-size: 0.95rem; font-weight: 600; margin-bottom: 16px; color: #ccc; }
+    label { display: block; font-size: 0.75rem; color: #666; margin-bottom: 4px; margin-top: 12px; }
+    input, select { width: 100%; padding: 8px 12px; background: #111; border: 1px solid #333; border-radius: 8px; color: #e5e5e5; font-size: 0.875rem; }
+    button { margin-top: 16px; padding: 10px 20px; background: #4f46e5; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-size: 0.875rem; width: 100%; }
+    button:hover { background: #4338ca; }
+    button.secondary { background: #222; margin-top: 8px; }
+    .log { background: #0a0a0a; border: 1px solid #222; border-radius: 8px; padding: 12px; font-family: monospace; font-size: 0.75rem; color: #4ade80; max-height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.7rem; font-weight: 600; }
+    .badge.ok  { background: #052e16; color: #4ade80; }
+    .badge.err { background: #450a0a; color: #f87171; }
+    #status-bar { position: fixed; top: 0; left: 0; right: 0; background: #1e1b4b; padding: 8px 20px; font-size: 0.75rem; color: #818cf8; display: flex; gap: 16px; align-items: center; z-index: 999; }
+    #status-bar span { color: #4f46e5; font-weight: 600; }
+  </style>
+</head>
+<body>
+
+<div id="status-bar">
+  <span>ConvTrack Test Page</span>
+  <span id="st-session">session: —</span>
+  <span id="st-duration">0s</span>
+  <span id="st-pages">1 página</span>
+  <span id="st-rrweb">rrweb: —</span>
+</div>
+
+<div style="margin-top: 48px;">
+  <h1>Página de Teste — ConvTrack</h1>
+  <p>Use esta página para testar sessões, eventos e session replay.</p>
+
+  <!-- Track Event -->
+  <div class="card">
+    <h2>🎯 Disparar Evento</h2>
+    <label>Nome do evento</label>
+    <input id="ev-name" type="text" value="add_to_cart" />
+    <label>Propriedades (JSON)</label>
+    <input id="ev-props" type="text" value='{"product":"Produto X","value":97}' />
+    <button onclick="trackEvent()">Disparar evento</button>
+    <div class="log" id="ev-log" style="margin-top:12px;">Aguardando...</div>
+  </div>
+
+  <!-- Identify -->
+  <div class="card">
+    <h2>👤 Identify</h2>
+    <label>E-mail</label>
+    <input id="id-email" type="email" placeholder="teste@email.com" />
+    <label>Telefone</label>
+    <input id="id-phone" type="tel" placeholder="+5511999999999" />
+    <button onclick="doIdentify()">Identify</button>
+  </div>
+
+  <!-- Simulate purchase -->
+  <div class="card">
+    <h2>🛒 Simular Compra</h2>
+    <p style="font-size:0.8rem;color:#666;margin-bottom:0">Dispara evento <code style="color:#818cf8">purchase</code> com conversion server-side.</p>
+    <button onclick="simulatePurchase()">Simular compra (R$ 97)</button>
+    <button class="secondary" onclick="simulateLead()">Simular lead</button>
+  </div>
+
+  <!-- SPA navigation -->
+  <div class="card">
+    <h2>🔀 Simular SPA navigation</h2>
+    <p style="font-size:0.8rem;color:#666;margin-bottom:0">Testa incremento de page_count.</p>
+    <button onclick="simulateNav('/checkout')">Ir para /checkout</button>
+    <button class="secondary" onclick="simulateNav('/obrigado')">Ir para /obrigado</button>
+  </div>
+
+  <!-- Replay flush manual -->
+  <div class="card">
+    <h2>💾 Flush Replay → S3</h2>
+    <p style="font-size:0.8rem;color:#666;margin-bottom:0">Força o envio dos eventos rrweb do Redis para o S3 agora (sem precisar fechar a aba).</p>
+    <button onclick="flushReplay()" style="background:#059669;">Flush replay para S3</button>
+    <div class="log" id="flush-log" style="margin-top:12px;">Aguardando...</div>
+  </div>
+
+  <!-- Metrics -->
+  <div class="card">
+    <h2>📊 Dados capturados</h2>
+    <div id="metrics-log" class="log">Aguardando tracker...</div>
+  </div>
+</div>
+
+<!-- rrweb para session replay (bundle IIFE local) -->
+<script src="/rrweb.min.js"></script>
+
+<!-- ConvTrack tracker -->
+<script
+  src="/tracker.js"
+  data-key="ct_f0df2a2f1554ee4d4dda7944e265afc6cd77897bea889ea2"
+  data-api="http://localhost:8080"
+  data-replay="true"
+  data-replay-triggers="checkout,obrigado,test"
+></script>
+
+<script>
+  // ── Status bar ──────────────────────────────────────────────────────────────
+  function updateStatus() {
+    if (!window.ConvTrack) return;
+    document.getElementById('st-session').textContent = 'session: ' + window.ConvTrack.getSessionId().slice(0,8) + '…';
+    document.getElementById('st-rrweb').textContent   = 'rrweb: ' + (typeof rrweb !== 'undefined' ? '✅ carregado' : '❌ não carregado');
+  }
+
+  var durationEl = document.getElementById('st-duration');
+  var startTs    = Date.now();
+  setInterval(function () {
+    var s = Math.round((Date.now() - startTs) / 1000);
+    durationEl.textContent = s + 's na página';
+  }, 1000);
+
+  // ── Log helper ──────────────────────────────────────────────────────────────
+  function log(elId, msg, ok) {
+    var el = document.getElementById(elId);
+    var badge = ok === true ? '<span class="badge ok">OK</span>' : ok === false ? '<span class="badge err">ERR</span>' : '';
+    el.innerHTML = badge + ' ' + new Date().toLocaleTimeString() + ' — ' + msg + '\n' + el.innerHTML;
+  }
+
+  // ── Actions ─────────────────────────────────────────────────────────────────
+  function trackEvent() {
+    var name = document.getElementById('ev-name').value || 'test_event';
+    var props = {};
+    try { props = JSON.parse(document.getElementById('ev-props').value || '{}'); } catch(e) {}
+    window.ConvTrack.track(name, props);
+    log('ev-log', 'Disparou: ' + name + ' ' + JSON.stringify(props), true);
+  }
+
+  function doIdentify() {
+    var email = document.getElementById('id-email').value;
+    var phone = document.getElementById('id-phone').value;
+    window.ConvTrack.identify(email, phone);
+    log('ev-log', 'Identify: ' + (email || phone), true);
+  }
+
+  function simulatePurchase() {
+    window.ConvTrack.track('purchase', { value: 97, currency: 'BRL', product: 'Produto X' });
+    log('ev-log', 'purchase disparado', true);
+  }
+
+  function simulateLead() {
+    window.ConvTrack.track('lead', { source: 'test_page' });
+    log('ev-log', 'lead disparado', true);
+  }
+
+  function simulateNav(path) {
+    history.pushState({}, '', path);
+    document.getElementById('st-pages').textContent = 'navegou para ' + path;
+    log('ev-log', 'SPA nav → ' + path, true);
+  }
+
+  function flushReplay() {
+    if (typeof window._ctFlushReplay === 'function') {
+      window._ctFlushReplay();
+      log('flush-log', 'Flush enviado → aguardando resposta do S3...', true);
+      setTimeout(function () {
+        log('flush-log', 'Se aparecer no MinIO em ~2s, funcionou!', true);
+      }, 2000);
+    } else {
+      log('flush-log', 'rrweb não está gravando (path precisa ter /checkout ou /obrigado)', false);
+    }
+  }
+
+  // ── Show captured metrics ──────────────────────────────────────────────────
+  setTimeout(function () {
+    updateStatus();
+
+    var attr = window.ConvTrack ? window.ConvTrack.getAttribution() : {};
+    var info = [
+      'session_id : ' + (window.ConvTrack ? window.ConvTrack.getSessionId() : '?'),
+      'visitor_id : ' + (window.ConvTrack ? window.ConvTrack.getVisitorId() : '?'),
+      'screen     : ' + window.screen.width + 'x' + window.screen.height,
+      'timezone   : ' + (Intl.DateTimeFormat().resolvedOptions().timeZone || '?'),
+      'language   : ' + navigator.language,
+      'utm_source : ' + (attr.utm_source || '—'),
+      'fbclid     : ' + (attr.fbclid || '—'),
+      'rrweb      : ' + (typeof rrweb !== 'undefined' ? '✅ pronto para gravar' : '❌ não carregado'),
+    ].join('\n');
+    document.getElementById('metrics-log').textContent = info;
+  }, 500);
+</script>
+
+</body>
+</html>
