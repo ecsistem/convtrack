@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/ecsistem/convtrack/internal/models"
 	"github.com/google/uuid"
@@ -238,29 +237,36 @@ func validateType(t string) error {
 
 // FireConversionFromRule cria uma conversão server-side originada de uma regra client-side.
 // Chamado quando o tracker.js detecta fire_conversion=true numa regra.
-func (s *Service) FireConversionFromRule(ctx context.Context, projectID uuid.UUID, ruleID, sessionID, eventName string, value float64, currency string) error {
+// Retorna a conversão criada para que o caller possa enfileirar integrações (CAPI, TikTok, etc.).
+func (s *Service) FireConversionFromRule(ctx context.Context, projectID uuid.UUID, ruleID, sessionID, eventName string, value float64, currency string) (*models.Conversion, error) {
 	if currency == "" {
 		currency = "BRL"
 	}
-	_, err := s.db.Exec(ctx, `
+	var conv models.Conversion
+	err := s.db.QueryRow(ctx, `
 		INSERT INTO conversions
 			(project_id, session_id, external_id, event_name, value, currency, platform)
 		VALUES ($1,
 			(SELECT id FROM sessions WHERE id = $2::uuid LIMIT 1),
-			$3, $4, $5, $6, 'rule')`,
+			$3, $4, $5, $6, 'rule')
+		RETURNING id, project_id, session_id, COALESCE(external_id,''), event_name, value, currency,
+		          COALESCE(email_hash,''), COALESCE(phone_hash,''), COALESCE(platform,''),
+		          attributed, created_at,
+		          COALESCE(payment_method,''), status, COALESCE(product_name,''), product_cost`,
 		projectID,
 		sessionID,
 		"rule:"+ruleID,
 		eventName,
 		value,
 		currency,
+	).Scan(
+		&conv.ID, &conv.ProjectID, &conv.SessionID, &conv.ExternalID, &conv.EventName,
+		&conv.Value, &conv.Currency, &conv.EmailHash, &conv.PhoneHash, &conv.Platform,
+		&conv.Attributed, &conv.CreatedAt, &conv.PaymentMethod, &conv.Status,
+		&conv.ProductName, &conv.ProductCost,
 	)
 	if err != nil {
-		return fmt.Errorf("fire conversion from rule: %w", err)
+		return nil, fmt.Errorf("fire conversion from rule: %w", err)
 	}
-
-	// Marca como necessitando de disparo de integrações — o worker pega via polling
-	// (simplificação: o webhook handler que cria conversões já enfileira automaticamente)
-	_ = time.Now() // placeholder para futura extensão
-	return nil
+	return &conv, nil
 }

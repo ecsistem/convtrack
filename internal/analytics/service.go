@@ -3,6 +3,7 @@ package analytics
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -95,6 +96,21 @@ type SourceStats struct {
 	Sales    int     `json:"sales"`
 	Revenue  float64 `json:"revenue"`
 	Leads    int     `json:"leads"`
+}
+
+// CampaignStat is the full UTMify-style per-campaign breakdown.
+type CampaignStat struct {
+	Source   string   `json:"source"`
+	Medium   string   `json:"medium"`
+	Campaign string   `json:"campaign"`
+	Sessions int      `json:"sessions"`
+	Leads    int      `json:"leads"`
+	Sales    int      `json:"sales"`
+	Revenue  float64  `json:"revenue"`
+	AdSpend  float64  `json:"ad_spend"`
+	ROAS     *float64 `json:"roas"`
+	CPA      *float64 `json:"cpa"`
+	ROI      *float64 `json:"roi"`
 }
 
 type Analytics struct {
@@ -509,6 +525,77 @@ type AdCostRow struct {
 	Currency    string    `json:"currency"`
 }
 
+// GetCampaigns returns per-UTM-campaign metrics: sessions, leads, sales, revenue,
+// ad spend (joined from ad_costs), and computed ROAS / CPA / ROI.
+func (s *Service) GetCampaigns(ctx context.Context, projectID uuid.UUID, start, end time.Time) ([]CampaignStat, error) {
+	rows, err := s.db.Query(ctx, `
+		WITH session_base AS (
+			SELECT
+				COALESCE(NULLIF(a.utm_source,''),   '(direto)')        AS source,
+				COALESCE(NULLIF(a.utm_medium,''),   '(none)')          AS medium,
+				COALESCE(NULLIF(a.utm_campaign,''), '(sem campanha)')  AS campaign,
+				COUNT(DISTINCT s.id)                                    AS sessions,
+				COUNT(DISTINCT c.id) FILTER (WHERE c.event_name = 'Lead')                              AS leads,
+				COUNT(DISTINCT c.id) FILTER (WHERE c.event_name = 'Purchase' AND c.status = 'approved') AS sales,
+				COALESCE(SUM(c.value) FILTER (WHERE c.event_name = 'Purchase' AND c.status = 'approved'), 0) AS revenue
+			FROM sessions s
+			LEFT JOIN attributions a  ON a.session_id  = s.id AND a.project_id = s.project_id
+			LEFT JOIN conversions  c  ON c.session_id  = s.id AND c.project_id = s.project_id
+			WHERE s.project_id = $1 AND s.started_at >= $2 AND s.started_at < $3
+			GROUP BY source, medium, campaign
+		),
+		spend_base AS (
+			SELECT
+				COALESCE(NULLIF(utm_source,''),   '(direto)')        AS source,
+				COALESCE(NULLIF(utm_campaign,''), '(sem campanha)')  AS campaign,
+				SUM(amount) AS ad_spend
+			FROM ad_costs
+			WHERE project_id = $1 AND date >= $2::date AND date < $3::date
+			GROUP BY source, campaign
+		)
+		SELECT
+			sb.source, sb.medium, sb.campaign,
+			sb.sessions, sb.leads, sb.sales, sb.revenue,
+			COALESCE(sp.ad_spend, 0) AS ad_spend
+		FROM session_base sb
+		LEFT JOIN spend_base sp ON sp.source = sb.source AND sp.campaign = sb.campaign
+		ORDER BY sb.revenue DESC, sb.sessions DESC
+		LIMIT 200`,
+		projectID, start, end,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []CampaignStat
+	for rows.Next() {
+		var cs CampaignStat
+		if err := rows.Scan(
+			&cs.Source, &cs.Medium, &cs.Campaign,
+			&cs.Sessions, &cs.Leads, &cs.Sales, &cs.Revenue, &cs.AdSpend,
+		); err != nil {
+			return nil, err
+		}
+		// Computed metrics
+		if cs.AdSpend > 0 {
+			roas := cs.Revenue / cs.AdSpend
+			cs.ROAS = &roas
+			roi := (cs.Revenue - cs.AdSpend) / cs.AdSpend * 100
+			cs.ROI = &roi
+		}
+		if cs.Sales > 0 && cs.AdSpend > 0 {
+			cpa := cs.AdSpend / float64(cs.Sales)
+			cs.CPA = &cpa
+		}
+		out = append(out, cs)
+	}
+	if out == nil {
+		out = []CampaignStat{}
+	}
+	return out, nil
+}
+
 // buildConversionFilters returns (joinClause, whereClause, args).
 // withAttrJoin=true forces LEFT JOIN attributions (needed when filtering by source).
 func buildConversionFilters(f Filters, withAttrJoin bool) (string, string, []interface{}) {
@@ -602,6 +689,134 @@ func paymentLabel(method string) string {
 	}
 }
 
+// ─── Leads ───────────────────────────────────────────────────────────────────
+
+type LeadRow struct {
+	ID            string  `json:"id"`
+	CreatedAt     string  `json:"created_at"`
+	EventName     string  `json:"event_name"`
+	Value         float64 `json:"value"`
+	Currency      string  `json:"currency"`
+	Platform      string  `json:"platform"`
+	Status        string  `json:"status"`
+	EmailHash     string  `json:"email_hash"`
+	PhoneHash     string  `json:"phone_hash"`
+	Attributed    bool    `json:"attributed"`
+	UTMSource     string  `json:"utm_source"`
+	UTMMedium     string  `json:"utm_medium"`
+	UTMCampaign   string  `json:"utm_campaign"`
+	UTMContent    string  `json:"utm_content"`
+	LandingPage   string  `json:"landing_page"`
+	Device        string  `json:"device"`
+	Browser       string  `json:"browser"`
+	Country       string  `json:"country"`
+	City          string  `json:"city"`
+	SessionID     string  `json:"session_id"`
+}
+
+type LeadStats struct {
+	Total         int     `json:"total"`
+	Today         int     `json:"today"`
+	Week          int     `json:"week"`
+	Month         int     `json:"month"`
+	ConvRate      float64 `json:"conv_rate"`      // leads / sessions (30d)
+	AvgPerDay     float64 `json:"avg_per_day"`    // month / 30
+}
+
+// GetLeads retorna todas as conversões do projeto com info de sessão e UTM (CRM view).
+func (s *Service) GetLeads(ctx context.Context, projectID uuid.UUID, limit, offset int) ([]LeadRow, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT
+			c.id, c.created_at, c.event_name, COALESCE(c.value,0),
+			c.currency, COALESCE(c.platform,''), c.status,
+			COALESCE(c.email_hash,''), COALESCE(c.phone_hash,''),
+			c.attributed,
+			COALESCE(a.utm_source,''), COALESCE(a.utm_medium,''),
+			COALESCE(a.utm_campaign,''), COALESCE(a.utm_content,''),
+			COALESCE(s.landing_page,''), COALESCE(s.device,''),
+			COALESCE(s.browser,''), COALESCE(s.country,''), COALESCE(s.city,''),
+			COALESCE(c.session_id::text,'')
+		FROM conversions c
+		LEFT JOIN attributions a ON a.session_id = c.session_id
+		LEFT JOIN sessions s ON s.id = c.session_id
+		WHERE c.project_id = $1
+		ORDER BY c.created_at DESC
+		LIMIT $2 OFFSET $3`,
+		projectID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []LeadRow
+	for rows.Next() {
+		var r LeadRow
+		var createdAt time.Time
+		if err := rows.Scan(
+			&r.ID, &createdAt, &r.EventName, &r.Value,
+			&r.Currency, &r.Platform, &r.Status,
+			&r.EmailHash, &r.PhoneHash, &r.Attributed,
+			&r.UTMSource, &r.UTMMedium, &r.UTMCampaign, &r.UTMContent,
+			&r.LandingPage, &r.Device, &r.Browser, &r.Country, &r.City,
+			&r.SessionID,
+		); err != nil {
+			return nil, fmt.Errorf("GetLeads scan: %w", err)
+		}
+		r.CreatedAt = createdAt.Format(time.RFC3339)
+		list = append(list, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("GetLeads rows: %w", err)
+	}
+	return list, nil
+}
+
+// GetLeadStats retorna métricas resumidas de conversões (visão CRM).
+func (s *Service) GetLeadStats(ctx context.Context, projectID uuid.UUID) (LeadStats, error) {
+	loc, _ := time.LoadLocation("America/Sao_Paulo")
+	now := time.Now().In(loc)
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+
+	var st LeadStats
+	err := s.db.QueryRow(ctx, `
+		WITH leads AS (
+			SELECT created_at FROM conversions
+			WHERE project_id = $1
+		),
+		sessions_30d AS (
+			SELECT COUNT(*) AS cnt FROM sessions
+			WHERE project_id = $1 AND started_at >= $2
+		)
+		SELECT
+			(SELECT COUNT(*) FROM leads),
+			(SELECT COUNT(*) FROM leads WHERE created_at >= $3),
+			(SELECT COUNT(*) FROM leads WHERE created_at >= $4),
+			(SELECT COUNT(*) FROM leads WHERE created_at >= $2),
+			(SELECT cnt FROM sessions_30d)`,
+		projectID,
+		today.AddDate(0, 0, -30),     // $2 month ago
+		today,                         // $3 today
+		today.AddDate(0, 0, -7),       // $4 week ago
+	).Scan(&st.Total, &st.Today, &st.Week, &st.Month, new(int))
+	if err != nil {
+		return st, err
+	}
+
+	var sessions30d int
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM sessions WHERE project_id=$1 AND started_at >= $2`,
+		projectID, today.AddDate(0, 0, -30),
+	).Scan(&sessions30d)
+
+	if sessions30d > 0 {
+		st.ConvRate = float64(st.Month) / float64(sessions30d) * 100
+	}
+	if st.Month > 0 {
+		st.AvgPerDay = float64(st.Month) / 30
+	}
+	return st, nil
+}
+
 // prorateDailyExpenses converts monthly expenses to the fraction covering the period.
 func prorateDailyExpenses(monthly float64, start, end time.Time) float64 {
 	if monthly == 0 {
@@ -616,4 +831,117 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ─── Events ───────────────────────────────────────────────────────────────────
+
+type EventStat struct {
+	Name           string  `json:"name"`
+	Count          int     `json:"count"`
+	UniqueSessions int     `json:"unique_sessions"`
+	LastSeen       string  `json:"last_seen"`
+	PctOfTotal     float64 `json:"pct_of_total"` // relative to the most frequent event
+}
+
+type EventRow struct {
+	ID         string                 `json:"id"`
+	Name       string                 `json:"name"`
+	Properties map[string]interface{} `json:"properties"`
+	CreatedAt  string                 `json:"created_at"`
+	SessionID  string                 `json:"session_id"`
+	Device     string                 `json:"device"`
+	Browser    string                 `json:"browser"`
+	Country    string                 `json:"country"`
+	UTMSource  string                 `json:"utm_source"`
+	UTMCampaign string               `json:"utm_campaign"`
+}
+
+// GetEventStats retorna contagem de eventos agrupada por nome, com % relativa ao maior.
+func (s *Service) GetEventStats(ctx context.Context, projectID uuid.UUID, since time.Time) ([]EventStat, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT e.name,
+		       COUNT(*) AS cnt,
+		       COUNT(DISTINCT e.session_id) AS uniq,
+		       MAX(e.created_at)::text AS last_seen
+		FROM events e
+		WHERE e.project_id = $1 AND e.created_at >= $2
+		GROUP BY e.name
+		ORDER BY cnt DESC`,
+		projectID, since,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []EventStat
+	for rows.Next() {
+		var ev EventStat
+		if err := rows.Scan(&ev.Name, &ev.Count, &ev.UniqueSessions, &ev.LastSeen); err != nil {
+			return nil, fmt.Errorf("GetEventStats scan: %w", err)
+		}
+		list = append(list, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("GetEventStats rows: %w", err)
+	}
+
+	// Calcular % relativa ao maior
+	if len(list) > 0 {
+		maxCount := list[0].Count
+		for i := range list {
+			if maxCount > 0 {
+				list[i].PctOfTotal = float64(list[i].Count) / float64(maxCount) * 100
+			}
+		}
+	}
+	return list, nil
+}
+
+// GetEvents retorna eventos recentes com info de sessão e UTM.
+func (s *Service) GetEvents(ctx context.Context, projectID uuid.UUID, since time.Time, name string, limit, offset int) ([]EventRow, error) {
+	q := `
+		SELECT e.id, e.name, COALESCE(e.properties,'{}'),
+		       e.created_at::text, e.session_id::text,
+		       COALESCE(s.device,''), COALESCE(s.browser,''), COALESCE(s.country,''),
+		       COALESCE(a.utm_source,''), COALESCE(a.utm_campaign,'')
+		FROM events e
+		LEFT JOIN sessions s ON s.id = e.session_id
+		LEFT JOIN attributions a ON a.session_id = e.session_id
+		WHERE e.project_id = $1 AND e.created_at >= $2`
+	args := []interface{}{projectID, since}
+	if name != "" {
+		q += ` AND e.name = $3 ORDER BY e.created_at DESC LIMIT $4 OFFSET $5`
+		args = append(args, name, limit, offset)
+	} else {
+		q += ` ORDER BY e.created_at DESC LIMIT $3 OFFSET $4`
+		args = append(args, limit, offset)
+	}
+
+	rows, err := s.db.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []EventRow
+	for rows.Next() {
+		var ev EventRow
+		var propsJSON []byte
+		if err := rows.Scan(
+			&ev.ID, &ev.Name, &propsJSON, &ev.CreatedAt, &ev.SessionID,
+			&ev.Device, &ev.Browser, &ev.Country, &ev.UTMSource, &ev.UTMCampaign,
+		); err != nil {
+			return nil, fmt.Errorf("GetEvents scan: %w", err)
+		}
+		_ = json.Unmarshal(propsJSON, &ev.Properties)
+		if ev.Properties == nil {
+			ev.Properties = map[string]interface{}{}
+		}
+		list = append(list, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("GetEvents rows: %w", err)
+	}
+	return list, nil
 }

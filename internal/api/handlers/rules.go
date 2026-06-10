@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"github.com/ecsistem/convtrack/internal/api/middleware"
+	"github.com/ecsistem/convtrack/internal/conversion"
 	"github.com/ecsistem/convtrack/internal/models"
 	"github.com/ecsistem/convtrack/internal/rules"
 	"github.com/gofiber/fiber/v2"
@@ -9,11 +10,12 @@ import (
 )
 
 type RulesHandler struct {
-	svc *rules.Service
+	svc     *rules.Service
+	convSvc *conversion.Service
 }
 
-func NewRules(svc *rules.Service) *RulesHandler {
-	return &RulesHandler{svc: svc}
+func NewRules(svc *rules.Service, convSvc *conversion.Service) *RulesHandler {
+	return &RulesHandler{svc: svc, convSvc: convSvc}
 }
 
 // GET /v1/rules
@@ -196,12 +198,21 @@ func (h *RulesHandler) ClientConversion(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
 	}
 
-	if err := h.svc.FireConversionFromRule(
+	conv, err := h.svc.FireConversionFromRule(
 		c.Context(), project.ID,
 		body.RuleID, body.SessionID,
 		body.EventName, body.Value, body.Currency,
-	); err != nil {
+	)
+	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
+
+	// Enfileira disparo de integrações (Meta CAPI, TikTok, Kwai, Google).
+	// Usa context.Background() pois a goroutine pode sobreviver ao request.
+	if h.convSvc != nil {
+		convCopy := conv
+		go h.convSvc.EnqueueIntegrations(c.Context(), convCopy)
+	}
+
 	return c.JSON(fiber.Map{"ok": true})
 }

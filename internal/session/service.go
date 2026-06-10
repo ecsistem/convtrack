@@ -303,3 +303,14 @@ func (s *Service) CountSessions(ctx context.Context, projectID uuid.UUID, since 
 	).Scan(&count)
 	return count, err
 }
+
+// OnlineCount returns the number of sessions active in the last 5 minutes.
+func (s *Service) OnlineCount(ctx context.Context, projectID uuid.UUID) (int, error) {
+	var count int
+	err := s.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM sessions
+		 WHERE project_id = $1 AND last_activity > NOW() - INTERVAL '5 minutes'`,
+		projectID,
+	).Scan(&count)
+	return count, err
+}
