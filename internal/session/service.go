@@ -113,17 +113,39 @@ func (s *Service) UpsertSession(ctx context.Context, in UpsertSessionInput) (*mo
 	return &sess, err
 }
 
-// Heartbeat — atualiza duração, página atual e contagem de páginas da sessão.
+// HeartbeatInput holds all metrics sent by the tracker on each heartbeat.
+type HeartbeatInput struct {
+	SessionID       string
+	DurationSeconds int
+	PageCount       int
+	CurrentPage     string
+	ClickCount      int
+	InputCount      int
+	ScrollDepthPct  int
+	RageClicks      int
+}
+
+// Heartbeat — atualiza duração, interações e página atual da sessão.
 // Chamado pelo tracker.js a cada 30 segundos e no beforeunload.
-func (s *Service) Heartbeat(ctx context.Context, sessionID uuid.UUID, durationSeconds, pageCount int, currentPage string) error {
-	_, err := s.db.Exec(ctx, `
+func (s *Service) Heartbeat(ctx context.Context, in HeartbeatInput) error {
+	sessionID, err := uuid.Parse(in.SessionID)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(ctx, `
 		UPDATE sessions SET
 			last_activity    = NOW(),
 			duration_seconds = GREATEST(duration_seconds, $2),
 			page_count       = GREATEST(page_count, $3),
-			exit_page        = CASE WHEN $4 != '' THEN $4 ELSE exit_page END
+			exit_page        = CASE WHEN $4 != '' THEN $4 ELSE exit_page END,
+			click_count      = GREATEST(click_count, $5),
+			input_count      = GREATEST(input_count, $6),
+			scroll_depth_pct = GREATEST(scroll_depth_pct, $7),
+			rage_clicks      = GREATEST(rage_clicks, $8)
 		WHERE id = $1`,
-		sessionID, durationSeconds, pageCount, currentPage,
+		sessionID,
+		in.DurationSeconds, in.PageCount, in.CurrentPage,
+		in.ClickCount, in.InputCount, in.ScrollDepthPct, in.RageClicks,
 	)
 	return err
 }
@@ -217,11 +239,20 @@ func (s *Service) ListSessions(ctx context.Context, projectID uuid.UUID, limit, 
 			COALESCE(s.screen_width,0), COALESCE(s.screen_height,0),
 			COALESCE(s.timezone,''), COALESCE(s.language,''),
 			COALESCE(s.duration_seconds,0), COALESCE(s.page_count,1), COALESCE(s.exit_page,''),
-			-- time_to_purchase: seconds between session start and first conversion
+			COALESCE(s.click_count,0), COALESCE(s.input_count,0),
+			COALESCE(s.scroll_depth_pct,0), COALESCE(s.rage_clicks,0),
+			-- time_to_purchase
 			(SELECT EXTRACT(EPOCH FROM MIN(c.created_at) - s.started_at)::INT
 			 FROM conversions c
-			 WHERE c.session_id = s.id AND c.status = 'approved') AS time_to_purchase
+			 WHERE c.session_id = s.id AND c.status = 'approved') AS time_to_purchase,
+			-- attribution
+			COALESCE(a.utm_source,''), COALESCE(a.utm_medium,''), COALESCE(a.utm_campaign,''),
+			-- event count
+			(SELECT COUNT(*) FROM events e WHERE e.session_id = s.id) AS event_count,
+			-- has replay
+			EXISTS(SELECT 1 FROM replays r WHERE r.session_id = s.id) AS has_replay
 		FROM sessions s
+		LEFT JOIN attributions a ON a.session_id = s.id
 		WHERE s.project_id = $1
 		ORDER BY s.started_at DESC
 		LIMIT $2 OFFSET $3`,
@@ -243,7 +274,10 @@ func (s *Service) ListSessions(ctx context.Context, projectID uuid.UUID, limit, 
 			&sess.ScreenWidth, &sess.ScreenHeight,
 			&sess.Timezone, &sess.Language,
 			&sess.DurationSeconds, &sess.PageCount, &sess.ExitPage,
+			&sess.ClickCount, &sess.InputCount, &sess.ScrollDepthPct, &sess.RageClicks,
 			&sess.TimeToPurchase,
+			&sess.UTMSource, &sess.UTMMedium, &sess.UTMCampaign,
+			&sess.EventCount, &sess.HasReplay,
 		); err != nil {
 			return nil, err
 		}

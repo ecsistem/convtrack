@@ -148,6 +148,49 @@
   var heartbeatTimer  = null;
   var HEARTBEAT_MS    = 30 * 1000; // 30 segundos
 
+  // ── Interaction counters ──────────────────────────────────────────────────
+
+  var clickCount     = 0;
+  var inputCount     = 0;
+  var scrollDepthPct = 0;
+  var rageClicks     = 0;
+
+  // Rage-click detection: 3+ clicks within 500ms on same element
+  var _rageTs      = [];
+  var _rageTarget  = null;
+
+  document.addEventListener('click', function (e) {
+    clickCount++;
+    // Rage-click
+    var now = Date.now();
+    if (e.target === _rageTarget) {
+      _rageTs.push(now);
+      _rageTs = _rageTs.filter(function (t) { return now - t < 500; });
+      if (_rageTs.length >= 3) { rageClicks++; _rageTs = []; }
+    } else {
+      _rageTarget = e.target;
+      _rageTs     = [now];
+    }
+  }, true);
+
+  // Input tracking (count keystrokes across all inputs/textareas)
+  document.addEventListener('input', function (e) {
+    var tag = (e.target && e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) {
+      inputCount++;
+    }
+  }, true);
+
+  // Scroll depth
+  function updateScrollDepth() {
+    var el      = document.documentElement;
+    var scrolled = (window.pageYOffset || el.scrollTop) + window.innerHeight;
+    var total    = el.scrollHeight || 1;
+    var pct      = Math.round((scrolled / total) * 100);
+    if (pct > scrollDepthPct) scrollDepthPct = Math.min(pct, 100);
+  }
+  window.addEventListener('scroll', updateScrollDepth, { passive: true });
+
   function isActive() { return document.visibilityState !== 'hidden'; }
 
   function startEngaged() {
@@ -173,12 +216,17 @@
 
   function sendHeartbeat(isFinal) {
     pauseEngaged();
+    updateScrollDepth();
     if (isFinal && !isActive()) startEngaged(); // resume tracker before final flush
     var body = {
       session_id:       sessionId,
       duration_seconds: totalDurationSeconds(),
       page_count:       pageCount,
       current_page:     currentPage,
+      click_count:      clickCount,
+      input_count:      inputCount,
+      scroll_depth_pct: scrollDepthPct,
+      rage_clicks:      rageClicks,
     };
     if (isFinal && navigator.sendBeacon) {
       navigator.sendBeacon(

@@ -83,6 +83,25 @@
     <div class="log" id="flush-log" style="margin-top:12px;">Aguardando...</div>
   </div>
 
+  <!-- UTM Tester -->
+  <div class="card">
+    <h2>🔗 Testar UTMs</h2>
+    <p style="font-size:0.8rem;color:#666;margin-bottom:0">Gera uma URL com UTMs e abre numa nova aba. A sessão criada aparece no dashboard com a campanha preenchida.</p>
+    <label>utm_source</label>
+    <input id="utm-source" type="text" value="facebook" />
+    <label>utm_medium</label>
+    <input id="utm-medium" type="text" value="cpc" />
+    <label>utm_campaign</label>
+    <input id="utm-campaign" type="text" value="black-friday" />
+    <label>utm_content</label>
+    <input id="utm-content" type="text" value="banner-v1" />
+    <label>utm_term</label>
+    <input id="utm-term" type="text" value="" placeholder="(opcional)" />
+    <button onclick="openWithUTMs()">Abrir nova aba com UTMs</button>
+    <button class="secondary" onclick="copyUTMUrl()">Copiar URL</button>
+    <div class="log" id="utm-log" style="margin-top:12px;">URL aparecerá aqui...</div>
+  </div>
+
   <!-- Metrics -->
   <div class="card">
     <h2>📊 Dados capturados</h2>
@@ -168,22 +187,58 @@
     }
   }
 
+  // ── UTM helpers ──────────────────────────────────────────────────────────────
+  function buildUTMUrl() {
+    var base   = window.location.origin + '/test.html';
+    var params = new URLSearchParams();
+    var src    = document.getElementById('utm-source').value.trim();
+    var med    = document.getElementById('utm-medium').value.trim();
+    var camp   = document.getElementById('utm-campaign').value.trim();
+    var cont   = document.getElementById('utm-content').value.trim();
+    var term   = document.getElementById('utm-term').value.trim();
+    if (src)  params.set('utm_source',   src);
+    if (med)  params.set('utm_medium',   med);
+    if (camp) params.set('utm_campaign', camp);
+    if (cont) params.set('utm_content',  cont);
+    if (term) params.set('utm_term',     term);
+    return base + '?' + params.toString();
+  }
+
+  function openWithUTMs() {
+    var url = buildUTMUrl();
+    document.getElementById('utm-log').textContent = '🔗 ' + url;
+    window.open(url, '_blank');
+    log('utm-log', 'Aba aberta! Aguarde ~2s e veja no dashboard → Sessões', true);
+  }
+
+  function copyUTMUrl() {
+    var url = buildUTMUrl();
+    navigator.clipboard.writeText(url).then(function () {
+      document.getElementById('utm-log').textContent = '📋 Copiado: ' + url;
+    });
+  }
+
   // ── Show captured metrics ──────────────────────────────────────────────────
   setTimeout(function () {
     updateStatus();
 
     var attr = window.ConvTrack ? window.ConvTrack.getAttribution() : {};
-    var info = [
-      'session_id : ' + (window.ConvTrack ? window.ConvTrack.getSessionId() : '?'),
-      'visitor_id : ' + (window.ConvTrack ? window.ConvTrack.getVisitorId() : '?'),
-      'screen     : ' + window.screen.width + 'x' + window.screen.height,
-      'timezone   : ' + (Intl.DateTimeFormat().resolvedOptions().timeZone || '?'),
-      'language   : ' + navigator.language,
-      'utm_source : ' + (attr.utm_source || '—'),
-      'fbclid     : ' + (attr.fbclid || '—'),
-      'rrweb      : ' + (typeof rrweb !== 'undefined' ? '✅ pronto para gravar' : '❌ não carregado'),
+    var currentUTMs = [
+      'utm_source   : ' + (attr.utm_source   || '— (não detectado na URL)'),
+      'utm_medium   : ' + (attr.utm_medium   || '—'),
+      'utm_campaign : ' + (attr.utm_campaign || '—'),
+      'utm_content  : ' + (attr.utm_content  || '—'),
+      'utm_term     : ' + (attr.utm_term     || '—'),
+      'fbclid       : ' + (attr.fbclid       || '—'),
+      '',
+      'session_id   : ' + (window.ConvTrack ? window.ConvTrack.getSessionId() : '?'),
+      'visitor_id   : ' + (window.ConvTrack ? window.ConvTrack.getVisitorId() : '?'),
+      'screen       : ' + window.screen.width + 'x' + window.screen.height,
+      'timezone     : ' + (Intl.DateTimeFormat().resolvedOptions().timeZone || '?'),
+      'language     : ' + navigator.language,
+      'rrweb        : ' + (typeof rrweb !== 'undefined' ? '✅ carregado' : '❌ não carregado'),
     ].join('\n');
-    document.getElementById('metrics-log').textContent = info;
+    document.getElementById('metrics-log').textContent = currentUTMs;
   }, 500);
 </script>
 

@@ -214,17 +214,25 @@ func (h *CollectHandler) Heartbeat(c *fiber.Ctx) error {
 		DurationSeconds int    `json:"duration_seconds"`
 		PageCount       int    `json:"page_count"`
 		CurrentPage     string `json:"current_page"`
+		ClickCount      int    `json:"click_count"`
+		InputCount      int    `json:"input_count"`
+		ScrollDepthPct  int    `json:"scroll_depth_pct"`
+		RageClicks      int    `json:"rage_clicks"`
 	}
 	if err := c.BodyParser(&body); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
 	}
 
-	sessionID, err := uuid.Parse(body.SessionID)
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid session_id"})
-	}
-
-	_ = h.sessions.Heartbeat(c.Context(), sessionID, body.DurationSeconds, body.PageCount, body.CurrentPage)
+	_ = h.sessions.Heartbeat(c.Context(), session.HeartbeatInput{
+		SessionID:       body.SessionID,
+		DurationSeconds: body.DurationSeconds,
+		PageCount:       body.PageCount,
+		CurrentPage:     body.CurrentPage,
+		ClickCount:      body.ClickCount,
+		InputCount:      body.InputCount,
+		ScrollDepthPct:  body.ScrollDepthPct,
+		RageClicks:      body.RageClicks,
+	})
 	return c.JSON(fiber.Map{"ok": true})
 }
 

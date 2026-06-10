@@ -58,8 +58,18 @@ type Session struct {
 	DurationSeconds int        `json:"duration_seconds" db:"duration_seconds"`
 	PageCount       int        `json:"page_count" db:"page_count"`
 	ExitPage        string     `json:"exit_page" db:"exit_page"`
-	// Computed — not stored, filled in dashboard queries
-	TimeToPurchase  *int       `json:"time_to_purchase,omitempty"` // seconds
+	// Interaction metrics (migration 010)
+	ClickCount      int        `json:"click_count" db:"click_count"`
+	InputCount      int        `json:"input_count" db:"input_count"`
+	ScrollDepthPct  int        `json:"scroll_depth_pct" db:"scroll_depth_pct"`
+	RageClicks      int        `json:"rage_clicks" db:"rage_clicks"`
+	// Computed — joined in dashboard queries
+	TimeToPurchase  *int       `json:"time_to_purchase,omitempty"`
+	UTMSource       string     `json:"utm_source"`
+	UTMMedium       string     `json:"utm_medium"`
+	UTMCampaign     string     `json:"utm_campaign"`
+	EventCount      int        `json:"event_count"`
+	HasReplay       bool       `json:"has_replay"`
 }
 
 type Attribution struct {
