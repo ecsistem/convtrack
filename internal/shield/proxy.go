@@ -55,6 +55,11 @@ func (s *Service) DomainProxyMiddleware(c *fiber.Ctx) error {
 	return s.proxyRequest(c, targetURL, campaign)
 }
 
+// ProxyTo é a versão pública de proxyRequest para uso nos handlers de slug.
+func (s *Service) ProxyTo(c *fiber.Ctx, targetURL string, campaign *Campaign) error {
+	return s.proxyRequest(c, targetURL, campaign)
+}
+
 // proxyRequest encaminha a requisição ao targetURL e retorna a resposta,
 // injetando o script de fingerprinting em páginas HTML.
 func (s *Service) proxyRequest(c *fiber.Ctx, targetURL string, campaign *Campaign) error {

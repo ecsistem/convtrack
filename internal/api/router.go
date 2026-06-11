@@ -178,6 +178,10 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	// Smart redirect avançado (fingerprinting + A/B, server-side)
 	app.Get("/r/:projectKey", apiKeyAuth, shieldH.SmartRedirectAdvanced)
 
+	// Slug cloaker — /:slug (sem autenticação, público)
+	// Deve ficar antes do catch-all de domínio mas após rotas fixas
+	app.Get("/:slug", shieldH.SlugCloak)
+
 	// ── Shield dashboard (JWT) ─────────────────────────────────────────────────
 	dash.Get("/shield/config",             shieldH.GetConfig)
 	dash.Put("/shield/config",             shieldH.PutConfig)

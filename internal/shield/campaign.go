@@ -4,10 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"hash/fnv"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+var slugRe = regexp.MustCompile(`[^a-z0-9\-]`)
+
+// sanitizeSlug converte para lowercase, substitui espaços por hífens e remove caracteres inválidos.
+func sanitizeSlug(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, " ", "-")
+	s = slugRe.ReplaceAllString(s, "")
+	s = regexp.MustCompile(`-+`).ReplaceAllString(s, "-")
+	return strings.Trim(s, "-")
+}
 
 // ── Campaign ──────────────────────────────────────────────────────────────
 
@@ -16,6 +29,7 @@ type Campaign struct {
 	ID        uuid.UUID `json:"id"         db:"id"`
 	ProjectID uuid.UUID `json:"project_id" db:"project_id"`
 	Name      string    `json:"name"       db:"name"`
+	Slug      string    `json:"slug"       db:"slug"`       // /slug na URL principal (ex: convtrack.com/minha-oferta)
 	SafeURL   string    `json:"safe_url"   db:"safe_url"`   // exibida para bots/revisores
 	MoneyURL  string    `json:"money_url"  db:"money_url"`  // exibida para humanos reais
 	SplitPct  int       `json:"split_pct"  db:"split_pct"`  // % de humanos → money_url
@@ -42,10 +56,11 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 	if c.SplitPct <= 0 || c.SplitPct > 100 {
 		c.SplitPct = 100
 	}
+	c.Slug = sanitizeSlug(c.Slug)
 	_, err := s.db.Exec(ctx, `
-		INSERT INTO shield_campaigns (id, project_id, name, safe_url, money_url, split_pct, enabled)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		c.ID, c.ProjectID, c.Name, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
+		INSERT INTO shield_campaigns (id, project_id, name, slug, safe_url, money_url, split_pct, enabled)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		c.ID, c.ProjectID, c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
 	)
 	if err != nil {
 		return nil, err
@@ -57,7 +72,7 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 
 func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Campaign, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT id, project_id, name, safe_url, money_url, split_pct, enabled, created_at, updated_at
+		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled, created_at, updated_at
 		FROM shield_campaigns WHERE project_id = $1 ORDER BY created_at DESC`, projectID)
 	if err != nil {
 		return nil, err
@@ -67,7 +82,7 @@ func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Cam
 	var list []Campaign
 	for rows.Next() {
 		var c Campaign
-		if err := rows.Scan(&c.ID, &c.ProjectID, &c.Name, &c.SafeURL, &c.MoneyURL,
+		if err := rows.Scan(&c.ID, &c.ProjectID, &c.Name, &c.Slug, &c.SafeURL, &c.MoneyURL,
 			&c.SplitPct, &c.Enabled, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			continue
 		}
@@ -83,11 +98,12 @@ func (s *Service) UpdateCampaign(ctx context.Context, c *Campaign) error {
 	if c.SplitPct <= 0 || c.SplitPct > 100 {
 		c.SplitPct = 100
 	}
+	c.Slug = sanitizeSlug(c.Slug)
 	_, err := s.db.Exec(ctx, `
 		UPDATE shield_campaigns
-		SET name=$1, safe_url=$2, money_url=$3, split_pct=$4, enabled=$5, updated_at=NOW()
-		WHERE id=$6 AND project_id=$7`,
-		c.Name, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled, c.ID, c.ProjectID,
+		SET name=$1, slug=$2, safe_url=$3, money_url=$4, split_pct=$5, enabled=$6, updated_at=NOW()
+		WHERE id=$7 AND project_id=$8`,
+		c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled, c.ID, c.ProjectID,
 	)
 	return err
 }
@@ -190,6 +206,47 @@ func (s *Service) ResolveCampaignByDomain(ctx context.Context, domain string) (*
 		}
 	}
 	return &c, nil
+}
+
+// ResolveCampaignBySlug localiza a campanha pelo slug (com cache Redis 5min).
+func (s *Service) ResolveCampaignBySlug(ctx context.Context, slug string) (*Campaign, error) {
+	if slug == "" {
+		return nil, nil
+	}
+	cacheKey := "shield_slug:" + slug
+	if s.rdb != nil {
+		if data, err := s.rdb.Get(ctx, cacheKey).Bytes(); err == nil {
+			var c Campaign
+			if json.Unmarshal(data, &c) == nil {
+				return &c, nil
+			}
+		}
+	}
+
+	var c Campaign
+	err := s.db.QueryRow(ctx, `
+		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled, created_at, updated_at
+		FROM shield_campaigns
+		WHERE slug = $1 AND enabled = true`, slug,
+	).Scan(&c.ID, &c.ProjectID, &c.Name, &c.Slug, &c.SafeURL, &c.MoneyURL,
+		&c.SplitPct, &c.Enabled, &c.CreatedAt, &c.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.rdb != nil {
+		if data, err := json.Marshal(c); err == nil {
+			_ = s.rdb.Set(ctx, cacheKey, data, 5*time.Minute)
+		}
+	}
+	return &c, nil
+}
+
+// InvalidateSlugCache remove o cache de um slug (chamar após update/delete).
+func (s *Service) InvalidateSlugCache(ctx context.Context, slug string) {
+	if s.rdb != nil && slug != "" {
+		_ = s.rdb.Del(ctx, "shield_slug:"+slug)
+	}
 }
 
 // ── A/B Split ─────────────────────────────────────────────────────────────

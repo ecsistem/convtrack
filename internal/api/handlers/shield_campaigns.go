@@ -2,12 +2,63 @@ package handlers
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/ecsistem/convtrack/internal/api/middleware"
 	"github.com/ecsistem/convtrack/internal/shield"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 )
+
+// ── Slug cloaker (público — sem autenticação) ─────────────────────────────
+
+// GET /:slug — entrada principal do cloaker por slug.
+// Bots/revisores → safe_url  |  Humanos → money_url.
+// O slug é só um ponto de entrada: redireciona para a raiz da URL destino
+// (não proxia o caminho completo — o domínio próprio faz proxy completo).
+func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
+	slug := c.Params("slug")
+	campaign, err := h.svc.ResolveCampaignBySlug(c.Context(), slug)
+	if err != nil || campaign == nil {
+		return c.Next() // slug não existe — deixa passar para outras rotas
+	}
+
+	ip := c.IP()
+	ua := c.Get("User-Agent")
+
+	result, _ := h.svc.Check(c.Context(), campaign.ProjectID, shield.CheckRequest{
+		IP:        ip,
+		UserAgent: ua,
+	})
+
+	var targetURL string
+	if result == nil || result.Allowed {
+		targetURL, _ = shield.ChooseURL(campaign, ip)
+	} else {
+		// bloqueado: manda para safe_url (ou redirect_url se configurado)
+		if result.RedirectURL != "" {
+			targetURL = result.RedirectURL
+		} else {
+			targetURL = campaign.SafeURL
+		}
+	}
+
+	if targetURL == "" {
+		return c.Status(fiber.StatusNotFound).SendString("campaign not configured")
+	}
+
+	// Repassa query strings originais (UTMs etc.) para a URL destino
+	qs := string(c.Request().URI().QueryString())
+	if qs != "" {
+		if strings.Contains(targetURL, "?") {
+			targetURL += "&" + qs
+		} else {
+			targetURL += "?" + qs
+		}
+	}
+
+	return c.Redirect(targetURL, fiber.StatusFound)
+}
 
 // ── Campanhas ─────────────────────────────────────────────────────────────
 
@@ -61,6 +112,7 @@ func (h *ShieldHandler) UpdateCampaign(c *fiber.Ctx) error {
 	if err := h.svc.UpdateCampaign(c.Context(), &cam); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
+	h.svc.InvalidateSlugCache(c.Context(), cam.Slug)
 	return c.JSON(fiber.Map{"ok": true})
 }
 
@@ -73,6 +125,14 @@ func (h *ShieldHandler) DeleteCampaign(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+	}
+	// busca o slug antes de deletar para invalidar o cache
+	campaigns, _ := h.svc.ListCampaigns(c.Context(), p.ID)
+	for _, cam := range campaigns {
+		if cam.ID == id {
+			h.svc.InvalidateSlugCache(c.Context(), cam.Slug)
+			break
+		}
 	}
 	if err := h.svc.DeleteCampaign(c.Context(), id, p.ID); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
