@@ -11,22 +11,33 @@ import (
 	"github.com/ecsistem/convtrack/internal/api"
 	"github.com/ecsistem/convtrack/internal/cache"
 	"github.com/ecsistem/convtrack/internal/db"
+	"github.com/ecsistem/convtrack/internal/migrator"
 	"github.com/ecsistem/convtrack/internal/queue"
+	convmigrations "github.com/ecsistem/convtrack/migrations"
 	"github.com/joho/godotenv"
 )
 
 func main() {
 	_ = godotenv.Load()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// Contexto amplo para inicialização (migrations podem demorar em cold start)
+	initCtx, initCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer initCancel()
 
-	pool, err := db.NewPool(ctx)
+	pool, err := db.NewPool(initCtx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "db: %v\n", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
+
+	// ── Auto-migrate ────────────────────────────────────────────────────────
+	// Aplica todas as migrations pendentes antes de iniciar o servidor.
+	// Seguro para re-executar: cada migration é rastreada em schema_migrations.
+	if err := migrator.Run(initCtx, pool, convmigrations.FS); err != nil {
+		fmt.Fprintf(os.Stderr, "migrator: %v\n", err)
+		os.Exit(1)
+	}
 
 	rdb := cache.New()
 	if err := rdb.Ping(context.Background()); err != nil {
@@ -37,7 +48,6 @@ func main() {
 	app := api.NewApp(pool, rdb, rdb.Client())
 
 	// Inicia o worker de fila com retry exponencial
-	// Contexto com cancel para shutdown gracioso
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
 
@@ -62,6 +72,6 @@ func main() {
 
 	<-quit
 	fmt.Println("shutting down...")
-	workerCancel() // para o worker primeiro
+	workerCancel()
 	_ = app.ShutdownWithTimeout(5 * time.Second)
 }

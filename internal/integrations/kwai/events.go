@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -87,12 +88,24 @@ func (c *Client) Send(ctx context.Context, events []Event) error {
 		return fmt.Errorf("kwai: marshal payload: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, eventsURL, bytes.NewReader(body))
+	// DEV MODE
+	targetURL := eventsURL
+	devHook := os.Getenv("DEV_WEBHOOK_URL")
+	if devHook != "" {
+		targetURL = devHook
+		fmt.Printf("[DEV] kwai → webhook: %s\n", devHook)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("kwai: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Access-Token", c.accessToken)
+	if devHook != "" {
+		req.Header.Set("X-ConvTrack-Platform", "kwai")
+		req.Header.Set("X-ConvTrack-Would-Send-To", eventsURL)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -101,6 +114,10 @@ func (c *Client) Send(ctx context.Context, events []Event) error {
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+
+	if devHook != "" {
+		return nil // webhook retorna 200 genérico — OK em dev
+	}
 
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("kwai: status %d — %s", resp.StatusCode, respBody)

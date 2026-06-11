@@ -16,6 +16,7 @@ import (
 	"github.com/ecsistem/convtrack/internal/replay"
 	"github.com/ecsistem/convtrack/internal/rules"
 	"github.com/ecsistem/convtrack/internal/session"
+	"github.com/ecsistem/convtrack/internal/shield"
 	"github.com/ecsistem/convtrack/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/logger"
@@ -54,6 +55,9 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 		replayH = handlers.NewReplay(replaySvc)
 	}
 
+	// ── Services ──────────────────────────────────────────────────────────────
+	shieldSvc := shield.New(db, rawRedis)
+
 	// ── Handlers ──────────────────────────────────────────────────────────────
 	collectH      := handlers.NewCollect(sessionSvc, attrSvc)
 	webhookH      := handlers.NewWebhook(convSvc, attrSvc)
@@ -64,6 +68,7 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	authH         := handlers.NewAuth(authSvc)
 	projectsH     := handlers.NewProjects(authSvc)
 	integrationsH := handlers.NewIntegrations(db)
+	shieldH       := handlers.NewShield(shieldSvc, rawRedis)
 
 	// ── Middleware factories ───────────────────────────────────────────────────
 	apiKeyAuth    := middleware.APIKey(db, rdb)
@@ -158,13 +163,58 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	}
 	dash.Options("/*", func(c *fiber.Ctx) error { return c.SendStatus(204) })
 
+	// APIBase para injeção de script no proxy reverso
+	shieldSvc.APIBase = os.Getenv("API_BASE_URL")
+
+	// ── Shield (público — tracker.js + fingerprint + smart redirect) ──────────
+	shieldCollect := app.Group("/v1/shield", middleware.CollectCORS())
+	shieldCollect.Post("/check",       apiKeyAuth, shieldH.Check)
+	shieldCollect.Post("/fingerprint", apiKeyAuth, shieldH.Fingerprint)
+	shieldCollect.Options("/*", func(c *fiber.Ctx) error { return c.SendStatus(204) })
+
+	// Script de fingerprinting (sem auth)
+	app.Get("/shield-fp.js", shieldH.ServeFPScript)
+
+	// Smart redirect avançado (fingerprinting + A/B, server-side)
+	app.Get("/r/:projectKey", apiKeyAuth, shieldH.SmartRedirectAdvanced)
+
+	// ── Shield dashboard (JWT) ─────────────────────────────────────────────────
+	dash.Get("/shield/config",             shieldH.GetConfig)
+	dash.Put("/shield/config",             shieldH.PutConfig)
+	dash.Get("/shield/logs",               shieldH.ListLogs)
+	dash.Delete("/shield/logs",            shieldH.ClearLogs)
+	dash.Get("/shield/stats",              shieldH.Stats)
+	dash.Get("/shield/logs/stream",        shieldH.StreamLogs)
+	// Campanhas
+	dash.Get("/shield/campaigns",          shieldH.ListCampaigns)
+	dash.Post("/shield/campaigns",         shieldH.CreateCampaign)
+	dash.Put("/shield/campaigns/:id",      shieldH.UpdateCampaign)
+	dash.Delete("/shield/campaigns/:id",   shieldH.DeleteCampaign)
+	// Domínios
+	dash.Get("/shield/domains",            shieldH.ListDomains)
+	dash.Post("/shield/domains",           shieldH.CreateDomain)
+	dash.Delete("/shield/domains/:id",     shieldH.DeleteDomain)
+	// Webhooks
+	dash.Get("/shield/webhooks",           shieldH.ListWebhooks)
+	dash.Post("/shield/webhooks",          shieldH.CreateWebhook)
+	dash.Delete("/shield/webhooks/:id",    shieldH.DeleteWebhook)
+	// Visitas com fingerprint
+	dash.Get("/shield/visits",             shieldH.ListVisits)
+
+	// ── Proxy reverso por domínio (catch-all — deve ficar APÓS todas as rotas) ─
+	// Habilitado apenas se API_BASE_URL estiver configurado
+	if shieldSvc.APIBase != "" {
+		app.Use(shieldSvc.DomainProxyMiddleware)
+	}
+
 	// ── Health & tracker ──────────────────────────────────────────────────────
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"ok": true})
 	})
-	app.Static("/tracker.js",   "./public/tracker.js")
-	app.Static("/rrweb.min.js", "./public/rrweb.min.js")
-	app.Static("/test.html",    "./public/test.html")
+	app.Static("/tracker.js",    "./public/tracker.js")
+	app.Static("/rrweb.min.js",  "./public/rrweb.min.js")
+	app.Static("/test.html",     "./public/test.html")
+	app.Static("/shield-fp.js",  "./public/shield-fp.js")
 
 	return app
 }

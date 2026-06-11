@@ -17,11 +17,17 @@ type accountKey struct{}
 // It sets c.Locals("project") so GetProject() works transparently in handlers.
 func JWTAuth(authSvc *auth.Service, db *pgxpool.Pool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Suporte a Bearer header E query param ?token= (necessário para EventSource/SSE)
+		tokenStr := ""
 		authHeader := c.Get("Authorization")
-		if !strings.HasPrefix(authHeader, "Bearer ") {
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			tokenStr = authHeader[7:]
+		} else if t := c.Query("token"); t != "" {
+			tokenStr = t
+		}
+		if tokenStr == "" {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing bearer token"})
 		}
-		tokenStr := authHeader[7:]
 
 		claims, err := authSvc.ValidateAccessToken(tokenStr)
 		if err != nil {

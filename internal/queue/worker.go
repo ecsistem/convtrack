@@ -280,7 +280,7 @@ func (w *Worker) loadContext(ctx context.Context, convIDStr, projectIDStr, platf
 	var conv models.Conversion
 	err = w.db.QueryRow(ctx, `
 		SELECT id, project_id, session_id, external_id, event_name, value, currency,
-		       email_hash, phone_hash, platform, attributed
+		       COALESCE(email_hash,''), COALESCE(phone_hash,''), COALESCE(platform,''), attributed
 		FROM conversions WHERE id = $1`, convID,
 	).Scan(&conv.ID, &conv.ProjectID, &conv.SessionID, &conv.ExternalID,
 		&conv.EventName, &conv.Value, &conv.Currency,

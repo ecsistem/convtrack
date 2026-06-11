@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -74,12 +75,23 @@ func (c *Client) Send(ctx context.Context, events []Event) (*Response, error) {
 		return nil, err
 	}
 
-	url := fmt.Sprintf(capiURL+"?access_token=%s", c.pixelID, c.accessToken)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	// DEV MODE: se DEV_WEBHOOK_URL estiver definida, redireciona para inspeção
+	targetURL := fmt.Sprintf(capiURL+"?access_token=%s", c.pixelID, c.accessToken)
+	devHook := os.Getenv("DEV_WEBHOOK_URL")
+	if devHook != "" {
+		targetURL = devHook
+		fmt.Printf("[DEV] meta → webhook: %s\n", devHook)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if devHook != "" {
+		req.Header.Set("X-ConvTrack-Platform", "meta")
+		req.Header.Set("X-ConvTrack-Would-Send-To", fmt.Sprintf(capiURL, c.pixelID))
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -88,6 +100,12 @@ func (c *Client) Send(ctx context.Context, events []Event) (*Response, error) {
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+
+	// Em modo dev o webhook retorna 200 mas não no formato do Meta — simula OK
+	if devHook != "" {
+		return &Response{EventsReceived: len(events)}, nil
+	}
+
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("meta capi error %d: %s", resp.StatusCode, respBody)
 	}

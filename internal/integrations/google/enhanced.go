@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -87,18 +88,33 @@ func (c *GA4Client) send(ctx context.Context, p GA4Payload) error {
 		return err
 	}
 
-	url := fmt.Sprintf("%s?measurement_id=%s&api_secret=%s", ga4URL, c.measurementID, c.apiSecret)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	// DEV MODE
+	targetURL := fmt.Sprintf("%s?measurement_id=%s&api_secret=%s", ga4URL, c.measurementID, c.apiSecret)
+	devHook := os.Getenv("DEV_WEBHOOK_URL")
+	if devHook != "" {
+		targetURL = devHook
+		fmt.Printf("[DEV] google/ga4 → webhook: %s\n", devHook)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if devHook != "" {
+		req.Header.Set("X-ConvTrack-Platform", "google")
+		req.Header.Set("X-ConvTrack-Would-Send-To", ga4URL)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("ga4 mp request: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if devHook != "" {
+		return nil // webhook retorna 200 genérico — OK em dev
+	}
 
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)

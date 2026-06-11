@@ -1,30 +1,28 @@
 services:
+
+  # ── Banco de dados ────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
+      POSTGRES_USER:     postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: convtrack
+      POSTGRES_DB:       convtrack
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql
-      - ./migrations/002_kwai.sql:/docker-entrypoint-initdb.d/002_kwai.sql
-      - ./migrations/003_replay_unique.sql:/docker-entrypoint-initdb.d/003_replay_unique.sql
-      - ./migrations/004_queue_and_security.sql:/docker-entrypoint-initdb.d/004_queue_and_security.sql
-      - ./migrations/005_trigger_rules.sql:/docker-entrypoint-initdb.d/005_trigger_rules.sql
-      - ./migrations/006_analytics.sql:/docker-entrypoint-initdb.d/006_analytics.sql
-      - ./migrations/007_auth.sql:/docker-entrypoint-initdb.d/007_auth.sql
-      - ./migrations/008_clone_protection.sql:/docker-entrypoint-initdb.d/008_clone_protection.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d convtrack"]
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 10s
 
+  # ── Cache / filas ─────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "6379:6379"
     volumes:
@@ -35,45 +33,82 @@ services:
       timeout: 3s
       retries: 5
 
+  # ── API + migrator automático ─────────────────────────────────────────────
+  # As migrations são embutidas no binário (go:embed).
+  # Na inicialização, o app detecta e aplica automaticamente todas as pendentes.
   api:
     build:
       context: .
       dockerfile: Dockerfile
+    restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
+      # ── Banco ──────────────────────────────────────────────────────
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/convtrack?sslmode=disable
+
+      # ── Redis ──────────────────────────────────────────────────────
       REDIS_ADDR: redis:6379
+
+      # ── Servidor ───────────────────────────────────────────────────
       PORT: 8080
-      FRONTEND_ORIGIN: http://localhost:3000
-      JWT_SECRET: cty2Q8OYqKOudFx2EaK2C77wV8ADvTKyVF4tt6ybfKc=
-      ENCRYPTION_KEY: NWtxjfFwUKLvxId747p6Qx2w4Ycvy5FpQZ+Dt4EmJJM=
-      S3_ENDPOINT: https://s3.betsbola.site
-      S3_REGION: us-east-1
-      S3_ACCESS_KEY_ID: n0J3xkNOZxcYelS02fBM
-      S3_SECRET_ACCESS_KEY: 6AJOvZSRv6lCC3rGMwjQIIxZQkMh8W1vk8yS60e1
-      S3_DEFAULT_BUCKET: betsbola
+
+      # ── Auth ───────────────────────────────────────────────────────
+      # Em produção: gere com `openssl rand -base64 32`
+      JWT_SECRET:      ${JWT_SECRET:-cty2Q8OYqKOudFx2EaK2C77wV8ADvTKyVF4tt6ybfKc=}
+      ENCRYPTION_KEY:  ${ENCRYPTION_KEY:-NWtxjfFwUKLvxId747p6Qx2w4Ycvy5FpQZ+Dt4EmJJM=}
+
+      # ── CORS ───────────────────────────────────────────────────────
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+
+      # ── Shield — URL pública desta API (para injeção de script no proxy reverso)
+      # Em produção: https://api.seudominio.com
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:8080}
+
+      # ── S3 para session replay (opcional) ─────────────────────────
+      S3_ENDPOINT:          ${S3_ENDPOINT:-}
+      S3_REGION:            ${S3_REGION:-us-east-1}
+      S3_ACCESS_KEY_ID:     ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_DEFAULT_BUCKET:    ${S3_DEFAULT_BUCKET:-convtrack-replays}
+
+      # ── DEV: redireciona CAPIs para inspeção (remova em produção) ──
+      DEV_WEBHOOK_URL: ${DEV_WEBHOOK_URL:-}
+
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+
     volumes:
+      # Assets públicos em modo dev (hot-reload de tracker.js/shield-fp.js)
       - ./public:/app/public
 
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ── Frontend Next.js ──────────────────────────────────────────────────────
   web:
     build:
       context: ../convtrack-web
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:8080
+        # URL que o browser usa para chamar a API (deve ser acessível externamente)
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+    restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8080
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
       NODE_ENV: production
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
 volumes:
   pgdata:

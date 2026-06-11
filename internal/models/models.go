@@ -171,6 +171,42 @@ type TriggerRule struct {
 	UpdatedAt      time.Time              `json:"updated_at"`
 }
 
+// ── Shield ────────────────────────────────────────────────────────────────
+
+// ShieldConfig armazena as configurações de proteção por projeto.
+type ShieldConfig struct {
+	ProjectID       string   `json:"project_id"       db:"project_id"`
+	Enabled         bool     `json:"enabled"          db:"enabled"`
+	BlockBots       bool     `json:"block_bots"       db:"block_bots"`
+	BlockHeadless   bool     `json:"block_headless"   db:"block_headless"`
+	BlockSpyTools   bool     `json:"block_spy_tools"  db:"block_spy_tools"`
+	BlockVPN        bool     `json:"block_vpn"        db:"block_vpn"`
+	BlockDatacenter bool     `json:"block_datacenter" db:"block_datacenter"`
+	AntiDevTools    bool     `json:"anti_devtools"    db:"anti_devtools"`
+	GeoMode         string   `json:"geo_mode"         db:"geo_mode"`      // disabled|allowlist|blocklist
+	GeoCountries    []string `json:"geo_countries"    db:"geo_countries"`
+	DeviceFilter    string   `json:"device_filter"    db:"device_filter"` // all|mobile|desktop
+	RedirectURL     string   `json:"redirect_url"     db:"redirect_url"`
+	PrimaryURL      string   `json:"primary_url"      db:"primary_url"`
+	FallbackURLs    []string `json:"fallback_urls"    db:"fallback_urls"`
+	BlockedIPs      []string `json:"blocked_ips"      db:"blocked_ips"`
+	UpdatedAt       string   `json:"updated_at"       db:"updated_at"`
+}
+
+// ShieldLog registra cada decisão de bloqueio/permissão.
+type ShieldLog struct {
+	ID         string `json:"id"          db:"id"`
+	ProjectID  string `json:"project_id"  db:"project_id"`
+	IP         string `json:"ip"          db:"ip"`
+	UserAgent  string `json:"user_agent"  db:"user_agent"`
+	Country    string `json:"country"     db:"country"`
+	Device     string `json:"device"      db:"device"`
+	Reason     string `json:"reason"      db:"reason"`
+	Action     string `json:"action"      db:"action"`
+	RedirectTo string `json:"redirect_to" db:"redirect_to"`
+	CreatedAt  string `json:"created_at"  db:"created_at"`
+}
+
 // ConversionWithAttribution is used for dashboard queries
 type ConversionWithAttribution struct {
 	Conversion

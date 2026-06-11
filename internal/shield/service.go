@@ -1,0 +1,419 @@
+package shield
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/ecsistem/convtrack/internal/models"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+)
+
+// Service executa as verificações de proteção e persiste configurações/logs.
+type Service struct {
+	db      *pgxpool.Pool
+	rdb     *redis.Client
+	APIBase string // ex: "https://api.convtrack.com" — usado pelo proxy para injetar o script
+}
+
+// New cria um novo shield.Service.
+func New(db *pgxpool.Pool, rdb *redis.Client) *Service {
+	return &Service{db: db, rdb: rdb}
+}
+
+// DB expõe o pool de banco de dados para handlers que precisam de queries ad-hoc.
+func (s *Service) DB() *pgxpool.Pool { return s.db }
+
+// ── Config ────────────────────────────────────────────────────────────────
+
+// GetConfig retorna a configuração de shield do projeto (cria default se não existe).
+func (s *Service) GetConfig(ctx context.Context, projectID uuid.UUID) (*models.ShieldConfig, error) {
+	cfg := &models.ShieldConfig{}
+	row := s.db.QueryRow(ctx, `
+		SELECT project_id::text, enabled, block_bots, block_headless, block_spy_tools,
+		       block_vpn, block_datacenter, anti_devtools,
+		       geo_mode, geo_countries, device_filter,
+		       redirect_url, primary_url, fallback_urls, blocked_ips,
+		       updated_at::text
+		FROM shield_configs WHERE project_id = $1`, projectID)
+
+	var geoCountries, fallbackURLs, blockedIPs []string
+	err := row.Scan(
+		&cfg.ProjectID, &cfg.Enabled, &cfg.BlockBots, &cfg.BlockHeadless, &cfg.BlockSpyTools,
+		&cfg.BlockVPN, &cfg.BlockDatacenter, &cfg.AntiDevTools,
+		&cfg.GeoMode, &geoCountries, &cfg.DeviceFilter,
+		&cfg.RedirectURL, &cfg.PrimaryURL, &fallbackURLs, &blockedIPs,
+		&cfg.UpdatedAt,
+	)
+	if err != nil {
+		// cria default
+		_, err2 := s.db.Exec(ctx,
+			`INSERT INTO shield_configs (project_id) VALUES ($1) ON CONFLICT DO NOTHING`, projectID)
+		if err2 != nil {
+			return nil, err2
+		}
+		cfg.ProjectID = projectID.String()
+		cfg.GeoMode = "disabled"
+		cfg.DeviceFilter = "all"
+		cfg.BlockBots = true
+		cfg.BlockHeadless = true
+		cfg.BlockSpyTools = true
+		cfg.GeoCountries = []string{}
+		cfg.FallbackURLs = []string{}
+		cfg.BlockedIPs = []string{}
+		return cfg, nil
+	}
+
+	cfg.GeoCountries = geoCountries
+	cfg.FallbackURLs = fallbackURLs
+	cfg.BlockedIPs = blockedIPs
+	return cfg, nil
+}
+
+// UpsertConfig salva/atualiza a configuração.
+func (s *Service) UpsertConfig(ctx context.Context, projectID uuid.UUID, cfg *models.ShieldConfig) error {
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO shield_configs (
+			project_id, enabled, block_bots, block_headless, block_spy_tools,
+			block_vpn, block_datacenter, anti_devtools,
+			geo_mode, geo_countries, device_filter,
+			redirect_url, primary_url, fallback_urls, blocked_ips, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
+		ON CONFLICT (project_id) DO UPDATE SET
+			enabled          = EXCLUDED.enabled,
+			block_bots       = EXCLUDED.block_bots,
+			block_headless   = EXCLUDED.block_headless,
+			block_spy_tools  = EXCLUDED.block_spy_tools,
+			block_vpn        = EXCLUDED.block_vpn,
+			block_datacenter = EXCLUDED.block_datacenter,
+			anti_devtools    = EXCLUDED.anti_devtools,
+			geo_mode         = EXCLUDED.geo_mode,
+			geo_countries    = EXCLUDED.geo_countries,
+			device_filter    = EXCLUDED.device_filter,
+			redirect_url     = EXCLUDED.redirect_url,
+			primary_url      = EXCLUDED.primary_url,
+			fallback_urls    = EXCLUDED.fallback_urls,
+			blocked_ips      = EXCLUDED.blocked_ips,
+			updated_at       = NOW()`,
+		projectID,
+		cfg.Enabled, cfg.BlockBots, cfg.BlockHeadless, cfg.BlockSpyTools,
+		cfg.BlockVPN, cfg.BlockDatacenter, cfg.AntiDevTools,
+		cfg.GeoMode, cfg.GeoCountries, cfg.DeviceFilter,
+		cfg.RedirectURL, cfg.PrimaryURL, cfg.FallbackURLs, cfg.BlockedIPs,
+	)
+	return err
+}
+
+// ── Logs ─────────────────────────────────────────────────────────────────
+
+// ListLogs retorna os últimos logs de shield do projeto.
+func (s *Service) ListLogs(ctx context.Context, projectID uuid.UUID, limit, offset int) ([]models.ShieldLog, int, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+
+	var total int
+	_ = s.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM shield_logs WHERE project_id = $1`, projectID,
+	).Scan(&total)
+
+	rows, err := s.db.Query(ctx, `
+		SELECT id::text, project_id::text, ip, user_agent, country, device,
+		       reason, action, redirect_to, created_at::text
+		FROM shield_logs
+		WHERE project_id = $1
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3`, projectID, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var logs []models.ShieldLog
+	for rows.Next() {
+		var l models.ShieldLog
+		if err := rows.Scan(&l.ID, &l.ProjectID, &l.IP, &l.UserAgent, &l.Country,
+			&l.Device, &l.Reason, &l.Action, &l.RedirectTo, &l.CreatedAt); err != nil {
+			continue
+		}
+		logs = append(logs, l)
+	}
+	if logs == nil {
+		logs = []models.ShieldLog{}
+	}
+	return logs, total, nil
+}
+
+// insertLog persiste o log e publica no Redis para o SSE.
+func (s *Service) insertLog(ctx context.Context, l *models.ShieldLog, projectID uuid.UUID) {
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO shield_logs (project_id, ip, user_agent, country, device, reason, action, redirect_to)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		projectID, l.IP, l.UserAgent, l.Country, l.Device, l.Reason, l.Action, l.RedirectTo,
+	)
+	if err != nil {
+		return
+	}
+	// Publica no canal Redis para SSE
+	data, _ := json.Marshal(l)
+	_ = s.rdb.Publish(ctx, fmt.Sprintf("shield:%s", projectID), string(data))
+}
+
+// ── Check ─────────────────────────────────────────────────────────────────
+
+// CheckRequest contém os dados de uma requisição a ser verificada.
+type CheckRequest struct {
+	IP           string
+	UserAgent    string
+	// Sinais do cliente (enviados pelo tracker.js)
+	WebDriver    bool
+	HeadlessHint bool // cliente detectou sinais de headless
+	DevTools     bool
+}
+
+// CheckResult é o resultado da verificação.
+type CheckResult struct {
+	Allowed     bool   `json:"allowed"`
+	Reason      string `json:"reason,omitempty"`
+	Action      string `json:"action,omitempty"`      // "blocked" | "redirected"
+	RedirectURL string `json:"redirect_url,omitempty"`
+	AntiDevTools bool  `json:"anti_devtools"`
+}
+
+// Check executa todas as verificações de proteção para um projeto.
+func (s *Service) Check(ctx context.Context, projectID uuid.UUID, req CheckRequest) (*CheckResult, error) {
+	cfg, err := s.GetConfig(ctx, projectID)
+	if err != nil {
+		return &CheckResult{Allowed: true}, nil
+	}
+
+	if !cfg.Enabled {
+		return &CheckResult{Allowed: true, AntiDevTools: cfg.AntiDevTools}, nil
+	}
+
+	ua := req.UserAgent
+
+	// ── Verificações client-side ────────────────────────────────────────
+	if req.WebDriver {
+		return s.block(ctx, projectID, cfg, req, "webdriver"), nil
+	}
+	if req.HeadlessHint && cfg.BlockHeadless {
+		return s.block(ctx, projectID, cfg, req, "headless"), nil
+	}
+	if req.DevTools && cfg.AntiDevTools {
+		return s.block(ctx, projectID, cfg, req, "devtools"), nil
+	}
+
+	// ── UA-based (server-side) ──────────────────────────────────────────
+	if cfg.BlockBots && isBot(ua) {
+		return s.block(ctx, projectID, cfg, req, "bot"), nil
+	}
+	if cfg.BlockSpyTools && isSpyTool(ua) {
+		return s.block(ctx, projectID, cfg, req, "spy_tool"), nil
+	}
+	if cfg.BlockHeadless && isHeadless(ua) {
+		return s.block(ctx, projectID, cfg, req, "headless"), nil
+	}
+
+	// ── IP blocklist ────────────────────────────────────────────────────
+	for _, blocked := range cfg.BlockedIPs {
+		if blocked != "" && req.IP == blocked {
+			return s.block(ctx, projectID, cfg, req, "ip_blocked"), nil
+		}
+	}
+
+	// ── Device filter ───────────────────────────────────────────────────
+	if cfg.DeviceFilter != "all" {
+		dev := deviceFromUA(ua)
+		if cfg.DeviceFilter == "mobile" && dev == "desktop" {
+			return s.block(ctx, projectID, cfg, req, "device"), nil
+		}
+		if cfg.DeviceFilter == "desktop" && dev == "mobile" {
+			return s.block(ctx, projectID, cfg, req, "device"), nil
+		}
+	}
+
+	// ── IP intelligence (GEO + VPN + datacenter) ──────────────────────
+	if cfg.BlockVPN || cfg.BlockDatacenter || cfg.GeoMode != "disabled" {
+		ipInfo := s.lookupIP(ctx, req.IP)
+
+		if cfg.BlockVPN && ipInfo.Proxy {
+			return s.block(ctx, projectID, cfg, req, "vpn"), nil
+		}
+		if cfg.BlockDatacenter && ipInfo.Hosting {
+			return s.block(ctx, projectID, cfg, req, "datacenter"), nil
+		}
+
+		if cfg.GeoMode == "allowlist" && ipInfo.Country != "" {
+			allowed := false
+			for _, c := range cfg.GeoCountries {
+				if strings.EqualFold(c, ipInfo.Country) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				req.UserAgent = ua // preserve
+				result := s.block(ctx, projectID, cfg, req, "geo")
+				result.Reason = fmt.Sprintf("geo:%s", ipInfo.Country)
+				return result, nil
+			}
+		}
+		if cfg.GeoMode == "blocklist" {
+			for _, c := range cfg.GeoCountries {
+				if strings.EqualFold(c, ipInfo.Country) {
+					result := s.block(ctx, projectID, cfg, req, "geo")
+					result.Reason = fmt.Sprintf("geo:%s", ipInfo.Country)
+					return result, nil
+				}
+			}
+		}
+	}
+
+	return &CheckResult{Allowed: true, AntiDevTools: cfg.AntiDevTools}, nil
+}
+
+// block monta o resultado de bloqueio e loga.
+func (s *Service) block(ctx context.Context, projectID uuid.UUID, cfg *models.ShieldConfig, req CheckRequest, reason string) *CheckResult {
+	action := "blocked"
+	redirectURL := cfg.RedirectURL
+
+	if redirectURL != "" {
+		action = "redirected"
+	}
+
+	log := &models.ShieldLog{
+		IP:         req.IP,
+		UserAgent:  req.UserAgent,
+		Device:     deviceFromUA(req.UserAgent),
+		Reason:     reason,
+		Action:     action,
+		RedirectTo: redirectURL,
+	}
+	go s.insertLog(context.Background(), log, projectID)
+
+	return &CheckResult{
+		Allowed:      false,
+		Reason:       reason,
+		Action:       action,
+		RedirectURL:  redirectURL,
+		AntiDevTools: cfg.AntiDevTools,
+	}
+}
+
+// ── IP Intelligence ──────────────────────────────────────────────────────
+
+type ipAPIResult struct {
+	Status  string `json:"status"`
+	Country string `json:"countryCode"`
+	Proxy   bool   `json:"proxy"`
+	Hosting bool   `json:"hosting"`
+}
+
+// lookupIP consulta ip-api.com com cache Redis de 1h.
+func (s *Service) lookupIP(ctx context.Context, ip string) ipAPIResult {
+	if ip == "" || ip == "127.0.0.1" || ip == "::1" ||
+		strings.HasPrefix(ip, "192.168.") || strings.HasPrefix(ip, "10.") ||
+		strings.HasPrefix(ip, "172.") {
+		return ipAPIResult{}
+	}
+
+	cacheKey := "shield_ip:" + ip
+	if s.rdb != nil {
+		if cached, err := s.rdb.Get(ctx, cacheKey).Bytes(); err == nil {
+			var r ipAPIResult
+			if json.Unmarshal(cached, &r) == nil {
+				return r
+			}
+		}
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode,proxy,hosting", ip)
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return ipAPIResult{}
+	}
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil || resp.StatusCode != 200 {
+		return ipAPIResult{}
+	}
+	defer resp.Body.Close()
+
+	var result ipAPIResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || result.Status != "success" {
+		return ipAPIResult{}
+	}
+
+	// Cache por 1 hora
+	if s.rdb != nil {
+		if data, err := json.Marshal(result); err == nil {
+			_ = s.rdb.Set(ctx, cacheKey, data, time.Hour)
+		}
+	}
+
+	return result
+}
+
+// ClearLogs apaga todos os logs de shield do projeto.
+func (s *Service) ClearLogs(ctx context.Context, projectID uuid.UUID) error {
+	_, err := s.db.Exec(ctx, `DELETE FROM shield_logs WHERE project_id = $1`, projectID)
+	return err
+}
+
+// StatRow agrupa contagem por motivo.
+type StatRow struct {
+	Reason string `json:"reason"`
+	Count  int    `json:"count"`
+}
+
+// StatsLogs retorna contagem de bloqueios agrupados por reason (últimos 7 dias).
+func (s *Service) StatsLogs(ctx context.Context, projectID uuid.UUID) ([]StatRow, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT reason, COUNT(*) AS cnt
+		FROM shield_logs
+		WHERE project_id = $1 AND created_at > NOW() - INTERVAL '7 days'
+		GROUP BY reason ORDER BY cnt DESC`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var stats []StatRow
+	for rows.Next() {
+		var r StatRow
+		if err := rows.Scan(&r.Reason, &r.Count); err != nil {
+			continue
+		}
+		stats = append(stats, r)
+	}
+	if stats == nil {
+		stats = []StatRow{}
+	}
+	return stats, nil
+}
+
+// ── Smart Redirect (server-side cloaking link) ───────────────────────────
+
+// SmartRedirect retorna a URL para onde o visitante deve ser redirecionado
+// após verificação server-side (sem JS). Usado pelo endpoint /r/:projectKey.
+func (s *Service) SmartRedirect(ctx context.Context, projectID uuid.UUID, req CheckRequest) (destination string, blocked bool) {
+	result, _ := s.Check(ctx, projectID, req)
+	if result == nil || result.Allowed {
+		cfg, _ := s.GetConfig(ctx, projectID)
+		if cfg != nil && cfg.PrimaryURL != "" {
+			return cfg.PrimaryURL, false
+		}
+		return "", false
+	}
+	// bloqueado
+	return result.RedirectURL, true
+}

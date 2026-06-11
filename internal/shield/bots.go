@@ -1,0 +1,95 @@
+package shield
+
+import "strings"
+
+// botPatterns — substrings de UA de bots/crawlers conhecidos
+var botPatterns = []string{
+	// Search engines
+	"googlebot", "google-read-aloud", "google-inspectiontool",
+	"bingbot", "msnbot", "baiduspider", "yandexbot", "duckduckbot",
+	"slurp", "sogou", "exabot", "facebot", "ia_archiver",
+	"applebot", "dotbot", "semrushbot", "ahrefsbot", "mj12bot",
+	"petalbot", "bytespider", "gptbot", "chatgpt-user",
+	// Social / link preview
+	"facebookexternalhit", "facebookcatalog", "facebot",
+	"twitterbot", "linkedinbot", "slackbot", "discordbot",
+	"telegrambot", "whatsapp", "pinterest", "vkshare",
+	"skypeuripreview", "snapchat",
+	// Generic
+	"bot", "crawler", "spider", "scraper", "fetcher", "archiver",
+	"wget", "curl", "python-requests", "python-urllib", "python-httpx",
+	"go-http-client", "java/", "okhttp", "axios/", "node-fetch",
+	"node.js", "libwww", "lwp", "httpclient", "apache-httpclient",
+	"mechanize", "scrapy", "phantomjs", "htmlunit",
+	// SEO / Analytics tools
+	"semrush", "ahrefs", "majestic", "rogerbot", "spyfu",
+	"seokicks", "sistrix", "opensiteexplorer",
+	// Security scanners
+	"nikto", "nmap", "masscan", "zgrab", "nuclei",
+	"sqlmap", "nessus", "openvas", "burpsuite", "w3af",
+}
+
+// spyToolPatterns — ferramentas de espionagem de criativos/anúncios
+var spyToolPatterns = []string{
+	"adspy", "bigspy", "pipiads", "minea", "poweradspy",
+	"adplexity", "advault", "socialadscout", "adbeat",
+	"whatrunswhere", "moat", "spyfu", "pathmatics", "adforum",
+	"adstransparency", "fbleadgen", "admobispy", "adsviser",
+	"dropispy", "ecomhunt", "ppspy", "adsreveal", "anstrex",
+	"advertiserscope", "adsspy", "adsmirror", "sellertools",
+	"intelligynce", "adsvault", "nativeadsbuzz", "spy.pet",
+}
+
+// headlessPatterns — indicadores de browser headless/automação
+var headlessPatterns = []string{
+	"headlesschrome", "headless", "phantomjs", "nightmare",
+	"puppeteer", "playwright", "selenium", "webdriver",
+	"htmlunit", "triton", "slimerjs", "casperjs",
+}
+
+// isBot verifica se o UA contém padrão de bot
+func isBot(ua string) bool {
+	lower := strings.ToLower(ua)
+	for _, p := range botPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSpyTool verifica se o UA pertence a ferramenta de espionagem
+func isSpyTool(ua string) bool {
+	lower := strings.ToLower(ua)
+	for _, p := range spyToolPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isHeadless verifica se o UA indica browser headless
+func isHeadless(ua string) bool {
+	lower := strings.ToLower(ua)
+	for _, p := range headlessPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// deviceFromUA retorna "mobile", "tablet" ou "desktop"
+func deviceFromUA(ua string) string {
+	lower := strings.ToLower(ua)
+	if strings.Contains(lower, "mobi") || strings.Contains(lower, "android") ||
+		strings.Contains(lower, "iphone") || strings.Contains(lower, "ipod") ||
+		strings.Contains(lower, "blackberry") || strings.Contains(lower, "windows phone") {
+		return "mobile"
+	}
+	if strings.Contains(lower, "ipad") || strings.Contains(lower, "tablet") {
+		return "tablet"
+	}
+	return "desktop"
+}

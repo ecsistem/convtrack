@@ -852,4 +852,143 @@
 
   })();
 
+
+  // ── Shield (Anti-Bot / Anti-DevTools / WebDriver) ─────────────────────────
+  // Lido pelo atributo data-shield="true" no script tag.
+  // Roda logo após o clone protection.
+
+  (function initShield() {
+    var shieldOn = script.getAttribute('data-shield') === 'true';
+    if (!shieldOn) return;
+    if (!apiBase || !apiKey) return;
+
+    // ── Detecções client-side ──────────────────────────────────────────────
+    var webdriver = !!(navigator.webdriver);
+    var headlessHint = /HeadlessChrome|PhantomJS|Playwright|Puppeteer|Selenium/i.test(navigator.userAgent);
+
+    var devToolsOpen = false;
+    var devToolsDetected = false;
+
+    // Detecção de DevTools via diferença de tamanho de janela
+    function checkDevToolsSize() {
+      var threshold = 160;
+      var widthDiff  = window.outerWidth  - window.innerWidth;
+      var heightDiff = window.outerHeight - window.innerHeight;
+      return widthDiff > threshold || heightDiff > threshold;
+    }
+
+    // Detecção via debugger timing (mais confiável mas mais pesada)
+    function checkDevToolsTiming() {
+      var start = performance.now();
+      // eslint-disable-next-line no-debugger
+      debugger; // pausa só se DevTools estiver aberto
+      return performance.now() - start > 100;
+    }
+
+    function detectDevTools() {
+      return checkDevToolsSize();
+    }
+
+    // ── Anti-DevTools: bloqueia atalhos e menu de contexto ────────────────
+    var antiDevToolsEnabled = false; // será atualizado após o /check
+
+    document.addEventListener('keydown', function (e) {
+      if (!antiDevToolsEnabled) return;
+      // F12
+      if (e.key === 'F12') { e.preventDefault(); return false; }
+      // Ctrl+Shift+I / Ctrl+Shift+J / Ctrl+Shift+C
+      if (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'J' || e.key === 'C')) {
+        e.preventDefault(); return false;
+      }
+      // Ctrl+U (view-source)
+      if (e.ctrlKey && e.key === 'u') { e.preventDefault(); return false; }
+    }, true);
+
+    document.addEventListener('contextmenu', function (e) {
+      if (!antiDevToolsEnabled) return;
+      e.preventDefault(); return false;
+    });
+
+    // Oculta conteúdo se DevTools abrir depois do carregamento
+    function onDevToolsOpened() {
+      if (devToolsDetected) return;
+      devToolsDetected = true;
+      // Reportar ao servidor
+      var body = JSON.stringify({ api_key: apiKey, webdriver: false, headless_hint: false, devtools: true });
+      navigator.sendBeacon(apiBase + '/v1/shield/check', body);
+      if (antiDevToolsEnabled) {
+        // Escurece a página
+        var overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:#000;';
+        document.body.appendChild(overlay);
+      }
+    }
+
+    // Poll de DevTools a cada 1.5s
+    var _devPoll = setInterval(function () {
+      if (detectDevTools()) {
+        devToolsOpen = true;
+        onDevToolsOpened();
+        clearInterval(_devPoll);
+      }
+    }, 1500);
+
+    // ── Chamada ao servidor ────────────────────────────────────────────────
+    function shieldCheck() {
+      var body = JSON.stringify({
+        api_key:      apiKey,
+        webdriver:    webdriver,
+        headless_hint: headlessHint,
+        devtools:     devToolsOpen,
+      });
+
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', apiBase + '/v1/shield/check', true);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.setRequestHeader('X-API-Key', apiKey);
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) return;
+        try {
+          var res = JSON.parse(xhr.responseText);
+
+          // Ativa anti-devtools se configurado
+          if (res.anti_devtools) {
+            antiDevToolsEnabled = true;
+          }
+
+          if (!res.allowed) {
+            if (res.redirect_url) {
+              window.location.replace(res.redirect_url);
+            } else {
+              // Apaga o conteúdo da página silenciosamente
+              try {
+                document.documentElement.innerHTML = '';
+                document.title = '';
+              } catch (err) {}
+            }
+          }
+        } catch (e) { /* silencioso */ }
+      };
+      xhr.send(body);
+    }
+
+    // Bloqueia imediatamente se webdriver ou headless óbvio
+    if (webdriver || headlessHint) {
+      try {
+        document.documentElement.innerHTML = '';
+      } catch (e) {}
+      // Tenta reportar de qualquer forma
+      var beaconBody = JSON.stringify({ api_key: apiKey, webdriver: webdriver, headless_hint: headlessHint, devtools: false });
+      navigator.sendBeacon && navigator.sendBeacon(apiBase + '/v1/shield/check', beaconBody);
+      return; // Para a execução do shield (mas o resto do tracker continua separado)
+    }
+
+    // Aguarda DOM para não bloquear renderização
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', shieldCheck);
+    } else {
+      shieldCheck();
+    }
+  })();
+
 })(window, document);
