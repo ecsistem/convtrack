@@ -238,6 +238,56 @@ func (h *ShieldHandler) DeleteWebhook(c *fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
+// POST /v1/dashboard/shield/webhooks/:id/test
+// Dispara uma notificação de teste para o webhook especificado.
+func (h *ShieldHandler) TestWebhook(c *fiber.Ctx) error {
+	p := middleware.GetProject(c)
+	if p == nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+	}
+
+	// Carrega todos os webhooks do projeto e localiza o alvo
+	whs, err := h.svc.ListWebhooks(c.Context(), p.ID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	var target *shield.WebhookConfig
+	for i, w := range whs {
+		if w.ID == id {
+			target = &whs[i]
+			break
+		}
+	}
+	if target == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "webhook não encontrado"})
+	}
+
+	// Dispara direto para este webhook (ignora enabled/events — é um teste)
+	testPayload := map[string]interface{}{
+		"ip":         "192.0.2.1",
+		"reason":     "test",
+		"action":     "test",
+		"device":     "desktop",
+		"user_agent": "ConvTrack Shield Test/1.0",
+		"score":      0.97,
+		"signals":    []string{"webdriver", "headless"},
+		"note":       "Esta é uma notificação de teste do ConvTrack Shield",
+	}
+
+	if err := h.svc.FireSingleWebhook(c.Context(), *target, shield.EventBotDetected, testPayload); err != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
+			"error": "falha ao enviar: " + err.Error(),
+		})
+	}
+
+	return c.JSON(fiber.Map{"ok": true, "webhook": target.Name, "type": target.Type})
+}
+
 // ── Fingerprint (público — chamado pelo shield-fp.js) ─────────────────────
 
 // POST /v1/shield/fingerprint
@@ -297,10 +347,13 @@ func (h *ShieldHandler) SmartRedirectAdvanced(c *fiber.Ctx) error {
 	ua := c.Get("User-Agent")
 	ip := c.IP()
 
-	// Verificação rápida server-side para bots óbvios
+	// Verificação rápida server-side para bots óbvios.
+	// SkipVisit=true porque humanos passam para ProcessFingerprint (que registra a visita completa).
+	// Bots bloqueados aqui já têm a visita registrada via block() → insertVisit.
 	result, _ := h.svc.Check(c.Context(), p.ID, shield.CheckRequest{
 		IP:        ip,
 		UserAgent: ua,
+		SkipVisit: true,
 	})
 
 	if result != nil && !result.Allowed {

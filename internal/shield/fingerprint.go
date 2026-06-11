@@ -138,8 +138,10 @@ func (s *Service) ProcessFingerprint(ctx context.Context, projectID uuid.UUID, i
 	}
 
 	// ── IP intelligence (async; usa cache Redis) ──────────────────────
+	var country string
 	if cfg.BlockVPN || cfg.BlockDatacenter || cfg.GeoMode != "disabled" {
 		ipInfo := s.lookupIP(ctx, ip)
+		country = ipInfo.Country // captura país para shield_visits
 		if cfg.BlockVPN && ipInfo.Proxy {
 			signals = append(signals, "vpn")
 		}
@@ -184,9 +186,23 @@ func (s *Service) ProcessFingerprint(ctx context.Context, projectID uuid.UUID, i
 		AntiDevTools: cfg.AntiDevTools,
 	}
 
+	device := deviceFromUA(ua)
+
 	if !isBot {
 		result.Allowed = true
 		result.Action = "money"
+
+		// Registra visita humana em shield_visits
+		go s.insertVisit(context.Background(), projectID, VisitRecord{
+			IP:        ip,
+			UserAgent: ua,
+			Country:   country,
+			Device:    device,
+			IsBot:     false,
+			BotScore:  botScore,
+			Signals:   signals,
+			Action:    "money",
+		})
 	} else {
 		result.Allowed = false
 		if cfg.RedirectURL != "" {
@@ -196,16 +212,27 @@ func (s *Service) ProcessFingerprint(ctx context.Context, projectID uuid.UUID, i
 			result.Action = "blocked"
 		}
 
-		// Log no shield_logs e dispara webhooks
+		// Log no shield_logs + shield_visits e dispara webhooks
 		log := &models.ShieldLog{
 			IP:         ip,
 			UserAgent:  ua,
-			Device:     deviceFromUA(ua),
+			Device:     device,
 			Reason:     "ml:" + strings.Join(signals, ","),
 			Action:     result.Action,
 			RedirectTo: result.RedirectURL,
 		}
 		go s.insertLog(context.Background(), log, projectID)
+		go s.insertVisit(context.Background(), projectID, VisitRecord{
+			IP:        ip,
+			UserAgent: ua,
+			Country:   country,
+			Device:    device,
+			IsBot:     true,
+			BotScore:  botScore,
+			Signals:   signals,
+			Action:    result.Action,
+			DestURL:   result.RedirectURL,
+		})
 		go s.FireWebhooks(context.Background(), projectID, "bot_detected", map[string]interface{}{
 			"ip":        ip,
 			"score":     botScore,

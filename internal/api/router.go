@@ -29,7 +29,9 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	app := fiber.New(fiber.Config{
 		AppName:      "ConvTrack API v1",
 		ErrorHandler: jsonErrorHandler,
-		BodyLimit:    8 * 1024 * 1024,
+		// 256 MB para suportar uploads de vídeo no endpoint /shield/videocamo
+		// (rota protegida por JWT — não acessível publicamente)
+		BodyLimit: 256 * 1024 * 1024,
 	})
 
 	app.Use(recover.New())
@@ -199,11 +201,16 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	dash.Post("/shield/domains",           shieldH.CreateDomain)
 	dash.Delete("/shield/domains/:id",     shieldH.DeleteDomain)
 	// Webhooks
-	dash.Get("/shield/webhooks",           shieldH.ListWebhooks)
-	dash.Post("/shield/webhooks",          shieldH.CreateWebhook)
-	dash.Delete("/shield/webhooks/:id",    shieldH.DeleteWebhook)
+	dash.Get("/shield/webhooks",                shieldH.ListWebhooks)
+	dash.Post("/shield/webhooks",               shieldH.CreateWebhook)
+	dash.Delete("/shield/webhooks/:id",         shieldH.DeleteWebhook)
+	dash.Post("/shield/webhooks/:id/test",      shieldH.TestWebhook)
 	// Visitas com fingerprint
 	dash.Get("/shield/visits",             shieldH.ListVisits)
+	// Camuflagem adversarial de imagem
+	dash.Post("/shield/imgcamo",           shieldH.CamouflageImage)
+	// Camuflagem adversarial de vídeo (frame a frame via ffmpeg)
+	dash.Post("/shield/videocamo",         shieldH.CamouflageVideo)
 
 	// ── Proxy reverso por domínio (catch-all — deve ficar APÓS todas as rotas) ─
 	// Habilitado apenas se API_BASE_URL estiver configurado

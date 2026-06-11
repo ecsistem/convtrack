@@ -19,8 +19,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # ── Runtime stage ─────────────────────────────────────────────────────────
 FROM alpine:3.20
 
-# TLS certs + timezone
-RUN apk --no-cache add ca-certificates tzdata
+# TLS certs + timezone + ffmpeg (camuflagem de vídeo frame a frame)
+RUN apk --no-cache add ca-certificates tzdata ffmpeg
 
 WORKDIR /app
 

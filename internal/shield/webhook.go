@@ -131,11 +131,30 @@ func (s *Service) dispatch(w WebhookConfig, event string, payload map[string]int
 	}
 }
 
+// FireSingleWebhook dispara para um único webhook e retorna erro se falhar.
+// Usado pelo endpoint de teste — ignora enabled/events para permitir testar qualquer webhook.
+func (s *Service) FireSingleWebhook(ctx context.Context, w WebhookConfig, event string, payload map[string]interface{}) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	switch w.Type {
+	case WebhookTelegram:
+		return s.sendTelegramErr(ctx, w, event, payload)
+	case WebhookDiscord:
+		return s.sendDiscordErr(ctx, w, event, payload)
+	default:
+		return s.sendCustomErr(ctx, w, event, payload)
+	}
+}
+
 // ── Telegram ──────────────────────────────────────────────────────────────
 
 func (s *Service) sendTelegram(ctx context.Context, w WebhookConfig, event string, payload map[string]interface{}) {
+	_ = s.sendTelegramErr(ctx, w, event, payload)
+}
+
+func (s *Service) sendTelegramErr(ctx context.Context, w WebhookConfig, event string, payload map[string]interface{}) error {
 	if w.Token == "" || w.ChatID == "" {
-		return
+		return fmt.Errorf("telegram: token ou chat_id não configurados")
 	}
 	text := buildText(event, payload)
 	body, _ := json.Marshal(map[string]interface{}{
@@ -143,61 +162,102 @@ func (s *Service) sendTelegram(ctx context.Context, w WebhookConfig, event strin
 		"text":       text,
 		"parse_mode": "HTML",
 	})
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", w.Token)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	if resp, err := http.DefaultClient.Do(req); err == nil {
-		resp.Body.Close()
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", w.Token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(body))
+	if err != nil {
+		return err
 	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("telegram: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("telegram: HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // ── Discord ───────────────────────────────────────────────────────────────
 
 func (s *Service) sendDiscord(ctx context.Context, w WebhookConfig, event string, payload map[string]interface{}) {
+	_ = s.sendDiscordErr(ctx, w, event, payload)
+}
+
+func (s *Service) sendDiscordErr(ctx context.Context, w WebhookConfig, event string, payload map[string]interface{}) error {
 	if w.URL == "" {
-		return
+		return fmt.Errorf("discord: URL não configurada")
 	}
 	color := 0x4f46e5 // indigo — evento genérico
 	if event == EventBotDetected {
 		color = 0xef4444 // red
 	} else if event == EventConversion {
 		color = 0x22c55e // green
+	} else if event == EventVisit {
+		color = 0x7c3aed // violet
 	}
 
+	// Campos ordenados para exibição previsível no Discord
+	orderedKeys := []string{"ip", "reason", "action", "device", "score", "signals", "user_agent", "note"}
+	seen := map[string]bool{}
 	var fields []map[string]interface{}
+	for _, k := range orderedKeys {
+		if v, ok := payload[k]; ok {
+			fields = append(fields, map[string]interface{}{
+				"name":   k,
+				"value":  fmt.Sprintf("`%v`", v),
+				"inline": true,
+			})
+			seen[k] = true
+		}
+	}
 	for k, v := range payload {
-		fields = append(fields, map[string]interface{}{
-			"name":   k,
-			"value":  fmt.Sprintf("%v", v),
-			"inline": true,
-		})
+		if !seen[k] {
+			fields = append(fields, map[string]interface{}{
+				"name":   k,
+				"value":  fmt.Sprintf("`%v`", v),
+				"inline": true,
+			})
+		}
 	}
 
 	body, _ := json.Marshal(map[string]interface{}{
 		"embeds": []map[string]interface{}{
 			{
-				"title":     "🛡️ ConvTrack Shield — " + event,
+				"title":     "🛡️ ConvTrack Shield · " + eventLabel(event),
 				"color":     color,
 				"fields":    fields,
 				"timestamp": time.Now().UTC().Format(time.RFC3339),
-				"footer": map[string]string{
-					"text": "ConvTrack Shield",
-				},
+				"footer":    map[string]string{"text": "ConvTrack Shield"},
 			},
 		},
 	})
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, w.URL, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	if resp, err := http.DefaultClient.Do(req); err == nil {
-		resp.Body.Close()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL, bytes.NewReader(body))
+	if err != nil {
+		return err
 	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("discord: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("discord: HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // ── Custom HTTP ───────────────────────────────────────────────────────────
 
 func (s *Service) sendCustom(ctx context.Context, w WebhookConfig, event string, payload map[string]interface{}) {
+	_ = s.sendCustomErr(ctx, w, event, payload)
+}
+
+func (s *Service) sendCustomErr(ctx context.Context, w WebhookConfig, event string, payload map[string]interface{}) error {
 	if w.URL == "" {
-		return
+		return fmt.Errorf("custom: URL não configurada")
 	}
 	envelope := map[string]interface{}{
 		"event":   event,
@@ -206,26 +266,63 @@ func (s *Service) sendCustom(ctx context.Context, w WebhookConfig, event string,
 		"source":  "convtrack-shield",
 	}
 	body, _ := json.Marshal(envelope)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, w.URL, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	if resp, err := http.DefaultClient.Do(req); err == nil {
-		resp.Body.Close()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL, bytes.NewReader(body))
+	if err != nil {
+		return err
 	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("http: status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
+func eventLabel(event string) string {
+	switch event {
+	case EventBotDetected:
+		return "Bot Detectado"
+	case EventVisit:
+		return "Nova Visita"
+	case EventConversion:
+		return "Conversão"
+	default:
+		return event
+	}
+}
+
 func buildText(event string, payload map[string]interface{}) string {
 	var sb strings.Builder
 	icon := "🛡️"
-	if event == EventBotDetected {
+	switch event {
+	case EventBotDetected:
 		icon = "🚫"
-	} else if event == EventConversion {
+	case EventConversion:
 		icon = "✅"
+	case EventVisit:
+		icon = "👤"
 	}
-	sb.WriteString(fmt.Sprintf("%s <b>ConvTrack Shield — %s</b>\n\n", icon, event))
+	sb.WriteString(fmt.Sprintf("%s <b>ConvTrack Shield · %s</b>\n\n", icon, eventLabel(event)))
+
+	// Campos em ordem previsível
+	orderedKeys := []string{"ip", "reason", "action", "device", "score", "signals", "user_agent", "note"}
+	seen := map[string]bool{}
+	for _, k := range orderedKeys {
+		if v, ok := payload[k]; ok {
+			sb.WriteString(fmt.Sprintf("<b>%s:</b> <code>%v</code>\n", k, v))
+			seen[k] = true
+		}
+	}
 	for k, v := range payload {
-		sb.WriteString(fmt.Sprintf("<b>%s:</b> <code>%v</code>\n", k, v))
+		if !seen[k] {
+			sb.WriteString(fmt.Sprintf("<b>%s:</b> <code>%v</code>\n", k, v))
+		}
 	}
 	return sb.String()
 }

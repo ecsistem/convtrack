@@ -174,6 +174,10 @@ type CheckRequest struct {
 	WebDriver    bool
 	HeadlessHint bool // cliente detectou sinais de headless
 	DevTools     bool
+	// SkipVisit impede o registro em shield_visits.
+	// Use true quando o Check é um pré-filtro rápido seguido de ProcessFingerprint
+	// (ex: SmartRedirectAdvanced), para evitar dupla contagem.
+	SkipVisit bool
 }
 
 // CheckResult é o resultado da verificação.
@@ -275,10 +279,31 @@ func (s *Service) Check(ctx context.Context, projectID uuid.UUID, req CheckReque
 		}
 	}
 
+	// Visita permitida — registra em shield_visits para métricas do dashboard.
+	// Omite quando SkipVisit=true (ex: pré-filtro rápido do SmartRedirectAdvanced
+	// que é seguido de ProcessFingerprint, o qual registra a visita completa).
+	if !req.SkipVisit {
+		go s.insertVisit(context.Background(), projectID, VisitRecord{
+			IP:        req.IP,
+			UserAgent: req.UserAgent,
+			Device:    deviceFromUA(req.UserAgent),
+			IsBot:     false,
+			BotScore:  0,
+			Signals:   []string{},
+			Action:    "money",
+		})
+		// Dispara evento "visit" para webhooks que assinam este evento
+		go s.FireWebhooks(context.Background(), projectID, EventVisit, map[string]interface{}{
+			"ip":         req.IP,
+			"device":     deviceFromUA(req.UserAgent),
+			"user_agent": req.UserAgent,
+		})
+	}
+
 	return &CheckResult{Allowed: true, AntiDevTools: cfg.AntiDevTools}, nil
 }
 
-// block monta o resultado de bloqueio e loga.
+// block monta o resultado de bloqueio, loga, registra em shield_visits e dispara webhooks.
 func (s *Service) block(ctx context.Context, projectID uuid.UUID, cfg *models.ShieldConfig, req CheckRequest, reason string) *CheckResult {
 	action := "blocked"
 	redirectURL := cfg.RedirectURL
@@ -287,15 +312,37 @@ func (s *Service) block(ctx context.Context, projectID uuid.UUID, cfg *models.Sh
 		action = "redirected"
 	}
 
+	device := deviceFromUA(req.UserAgent)
+
 	log := &models.ShieldLog{
 		IP:         req.IP,
 		UserAgent:  req.UserAgent,
-		Device:     deviceFromUA(req.UserAgent),
+		Device:     device,
 		Reason:     reason,
 		Action:     action,
 		RedirectTo: redirectURL,
 	}
 	go s.insertLog(context.Background(), log, projectID)
+	go s.insertVisit(context.Background(), projectID, VisitRecord{
+		IP:        req.IP,
+		UserAgent: req.UserAgent,
+		Device:    device,
+		IsBot:     true,
+		BotScore:  0.9,
+		Signals:   []string{reason},
+		Action:    action,
+		DestURL:   redirectURL,
+	})
+	// ── CRÍTICO: dispara webhooks "bot_detected" para TODOS os entry points ──
+	// (antes só era chamado em ProcessFingerprint, ignorando tracker.js e SlugCloak)
+	go s.FireWebhooks(context.Background(), projectID, EventBotDetected, map[string]interface{}{
+		"ip":         req.IP,
+		"reason":     reason,
+		"action":     action,
+		"device":     device,
+		"user_agent": req.UserAgent,
+		"redirect":   redirectURL,
+	})
 
 	return &CheckResult{
 		Allowed:      false,
@@ -304,6 +351,37 @@ func (s *Service) block(ctx context.Context, projectID uuid.UUID, cfg *models.Sh
 		RedirectURL:  redirectURL,
 		AntiDevTools: cfg.AntiDevTools,
 	}
+}
+
+// VisitRecord representa os dados de uma visita a ser persistida em shield_visits.
+type VisitRecord struct {
+	IP        string
+	UserAgent string
+	Country   string
+	Device    string
+	IsBot     bool
+	BotScore  float64
+	Signals   []string
+	Action    string // "money" | "safe" | "blocked" | "redirected"
+	DestURL   string
+}
+
+// insertVisit persiste um registro em shield_visits de forma assíncrona.
+// Chamado para TODOS os visitantes (humanos e bots) de todos os entry points.
+func (s *Service) insertVisit(ctx context.Context, projectID uuid.UUID, v VisitRecord) {
+	if v.Signals == nil {
+		v.Signals = []string{}
+	}
+	if v.Device == "" {
+		v.Device = deviceFromUA(v.UserAgent)
+	}
+	_, _ = s.db.Exec(ctx, `
+		INSERT INTO shield_visits
+		    (project_id, ip, user_agent, country, device, is_bot, bot_score, signals, action, dest_url)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		projectID, v.IP, v.UserAgent, v.Country, v.Device,
+		v.IsBot, v.BotScore, v.Signals, v.Action, v.DestURL,
+	)
 }
 
 // ── IP Intelligence ──────────────────────────────────────────────────────
