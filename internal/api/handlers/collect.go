@@ -218,6 +218,7 @@ func (h *CollectHandler) Heartbeat(c *fiber.Ctx) error {
 		InputCount      int    `json:"input_count"`
 		ScrollDepthPct  int    `json:"scroll_depth_pct"`
 		RageClicks      int    `json:"rage_clicks"`
+		IsFinal         bool   `json:"is_final"`
 	}
 	if err := c.BodyParser(&body); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
@@ -232,6 +233,7 @@ func (h *CollectHandler) Heartbeat(c *fiber.Ctx) error {
 		InputCount:      body.InputCount,
 		ScrollDepthPct:  body.ScrollDepthPct,
 		RageClicks:      body.RageClicks,
+		IsFinal:         body.IsFinal,
 	})
 	return c.JSON(fiber.Map{"ok": true})
 }

@@ -75,6 +75,21 @@ func normalizeDomain(d string) string {
 	d = strings.ToLower(strings.TrimSpace(d))
 	d = strings.TrimPrefix(d, "www.")
 	d = strings.TrimSuffix(d, ".")
+	// Remove port if present (e.g. "localhost:5500" → "localhost", "example.com:443" → "example.com")
+	if i := strings.LastIndex(d, ":"); i != -1 {
+		// Only strip if the part after ":" looks like a port number (all digits)
+		port := d[i+1:]
+		isPort := len(port) > 0
+		for _, c := range port {
+			if c < '0' || c > '9' {
+				isPort = false
+				break
+			}
+		}
+		if isPort {
+			d = d[:i]
+		}
+	}
 	return d
 }
 

@@ -629,11 +629,24 @@ func buildConversionFilters(f Filters, withAttrJoin bool) (string, string, []int
 }
 
 func buildEventFilters(f Filters) (string, []interface{}) {
+	// Cliques   = total de sessões no período (todo visitante que chegou via tracker).
+	//             Representa o topo do funil: cliques que geraram uma visita rastreada.
+	// Vis. Página = eventos de pageview registrados na tabela events.
+	//             O tracker.js dispara 'pageview' em cada carregamento de página
+	//             (initial load + navegação SPA). Subconjunto de sessões, sempre ≤ Cliques.
+	//
+	// Nota: anteriormente buscava events WHERE name='click' para Cliques, mas o tracker
+	// nunca dispara esse evento automaticamente — resultava sempre em 0.
 	q := `SELECT
-	        COUNT(*) FILTER (WHERE name = 'pageview'),
-	        COUNT(*) FILTER (WHERE name = 'click')
-	      FROM events
-	      WHERE project_id = $1 AND created_at >= $2 AND created_at < $3`
+	        -- Vis. Página: eventos pageview na tabela events (tracker.js v2.6+)
+	        (SELECT COUNT(*)
+	         FROM events
+	         WHERE project_id = $1 AND name = 'pageview'
+	           AND created_at >= $2 AND created_at < $3),
+	        -- Cliques: total de sessões no período (topo do funil)
+	        (SELECT COUNT(*)
+	         FROM sessions
+	         WHERE project_id = $1 AND started_at >= $2 AND started_at < $3)`
 	args := []interface{}{f.ProjectID, f.Start, f.End}
 	return q, args
 }

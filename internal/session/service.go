@@ -123,10 +123,11 @@ type HeartbeatInput struct {
 	InputCount      int
 	ScrollDepthPct  int
 	RageClicks      int
+	IsFinal         bool // true = beforeunload / pagehide / visibilitychange:hidden
 }
 
 // Heartbeat — atualiza duração, interações e página atual da sessão.
-// Chamado pelo tracker.js a cada 30 segundos e no beforeunload.
+// Quando IsFinal=true, seta ended_at para encerrar a sessão formalmente.
 func (s *Service) Heartbeat(ctx context.Context, in HeartbeatInput) error {
 	sessionID, err := uuid.Parse(in.SessionID)
 	if err != nil {
@@ -141,11 +142,13 @@ func (s *Service) Heartbeat(ctx context.Context, in HeartbeatInput) error {
 			click_count      = GREATEST(click_count, $5),
 			input_count      = GREATEST(input_count, $6),
 			scroll_depth_pct = GREATEST(scroll_depth_pct, $7),
-			rage_clicks      = GREATEST(rage_clicks, $8)
+			rage_clicks      = GREATEST(rage_clicks, $8),
+			ended_at         = CASE WHEN $9 AND ended_at IS NULL THEN NOW() ELSE ended_at END
 		WHERE id = $1`,
 		sessionID,
 		in.DurationSeconds, in.PageCount, in.CurrentPage,
 		in.ClickCount, in.InputCount, in.ScrollDepthPct, in.RageClicks,
+		in.IsFinal,
 	)
 	return err
 }

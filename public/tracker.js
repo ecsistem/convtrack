@@ -1,7 +1,7 @@
 (function (window, document) {
   'use strict';
 
-  var CT_VERSION      = '2.2.0';
+  var CT_VERSION      = '2.7.0';
   var STORAGE_VISITOR = 'ct_vid';
   var STORAGE_SESSION = 'ct_sid';
   var STORAGE_ATTR    = 'ct_attr';
@@ -114,18 +114,28 @@
     }
   }
 
-  // fire-and-forget: usa sendBeacon quando disponível (sobrevive ao beforeunload),
-  // com fallback para XHR assíncrono.
+  // fire-and-forget: usa fetch com keepalive:true (sobrevive ao beforeunload,
+  // funciona através de proxies como Cloudflare que bloqueiam sendBeacon).
+  // sendBeacon era problemático com application/json através de Cloudflare —
+  // o OPTIONS preflight chegava mas o POST era silenciosamente descartado.
   function send(path, body) {
     var data = JSON.stringify(Object.assign({ api_key: apiKey }, body));
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon(apiBase + path, new Blob([data], { type: 'application/json' }));
-    } else {
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', apiBase + path, true);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.setRequestHeader('X-API-Key', apiKey);
-      xhr.send(data);
+    try {
+      fetch(apiBase + path, {
+        method:    'POST',
+        headers:   { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+        body:      data,
+        keepalive: true,
+      }).catch(function () {});
+    } catch (e) {
+      // Fallback para XHR em browsers muito antigos
+      try {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', apiBase + path, true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.setRequestHeader('X-API-Key', apiKey);
+        xhr.send(data);
+      } catch (e2) {}
     }
   }
 
@@ -179,13 +189,19 @@
 
   // ── Engagement / duration tracking ───────────────────────────────────────
 
-  var sessionStartTs = Date.now();
-  var engagedMs      = 0;
-  var engagedStart   = null;
-  var pageCount      = 1;
-  var currentPage    = window.location.href;
-  var heartbeatTimer = null;
-  var HEARTBEAT_MS   = 30 * 1000;
+  var sessionStartTs    = Date.now();
+  var engagedMs         = 0;
+  var engagedStart      = null;
+  var pageCount         = 1;
+  var currentPage       = window.location.href;
+  var heartbeatTimer    = null;
+  var HEARTBEAT_MS      = 15 * 1000; // heartbeat periódico a cada 15s
+
+  // Controle de heartbeat por interação
+  var lastHeartbeatTs   = 0;
+  var interactionTimer  = null;
+  var MIN_INTERACT_MS   = 4000;  // envia no máximo 1 heartbeat de interação a cada 4s
+  var INTERACT_DEBOUNCE = 1500;  // aguarda 1.5s de inatividade antes de disparar
 
   var clickCount     = 0;
   var inputCount     = 0;
@@ -193,6 +209,17 @@
   var rageClicks     = 0;
   var _rageTs        = [];
   var _rageTarget    = null;
+
+  // Agenda heartbeat imediato após interação (debounced + throttled)
+  function scheduleInteractionHeartbeat() {
+    if (Date.now() - lastHeartbeatTs < MIN_INTERACT_MS) return; // muito cedo
+    clearTimeout(interactionTimer);
+    interactionTimer = setTimeout(function () {
+      if (Date.now() - lastHeartbeatTs >= MIN_INTERACT_MS) {
+        sendHeartbeat(false);
+      }
+    }, INTERACT_DEBOUNCE);
+  }
 
   document.addEventListener('click', function (e) {
     clickCount++;
@@ -202,11 +229,15 @@
       _rageTs = _rageTs.filter(function (t) { return now - t < 500; });
       if (_rageTs.length >= 3) { rageClicks++; _rageTs = []; }
     } else { _rageTarget = e.target; _rageTs = [now]; }
+    scheduleInteractionHeartbeat();
   }, true);
 
   document.addEventListener('input', function (e) {
     var tag = (e.target && e.target.tagName || '').toLowerCase();
-    if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) inputCount++;
+    if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) {
+      inputCount++;
+      scheduleInteractionHeartbeat();
+    }
   }, true);
 
   function updateScrollDepth() {
@@ -226,15 +257,15 @@
   }
 
   startEngaged();
-  document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState === 'hidden') pauseEngaged(); else startEngaged();
-  });
+  // visibilitychange é gerenciado abaixo junto com sendFinalHeartbeat
+  // para evitar conflito. focus/blur servem de fallback para janelas fora de foco.
   window.addEventListener('focus', startEngaged);
   window.addEventListener('blur',  pauseEngaged);
 
   function totalDurationSeconds() { return Math.round((Date.now() - sessionStartTs) / 1000); }
 
   function sendHeartbeat(isFinal) {
+    lastHeartbeatTs = Date.now();
     pauseEngaged();
     updateScrollDepth();
     var body = {
@@ -246,14 +277,26 @@
       input_count:      inputCount,
       scroll_depth_pct: scrollDepthPct,
       rage_clicks:      rageClicks,
+      is_final:         !!isFinal,
     };
-    if (isFinal && navigator.sendBeacon) {
-      navigator.sendBeacon(
-        apiBase + '/v1/collect/heartbeat',
-        new Blob([JSON.stringify(Object.assign({ api_key: apiKey }, body))], { type: 'application/json' })
-      );
-    } else {
-      send('/v1/collect/heartbeat', body);
+    // fetch + keepalive sobrevive ao fechamento da aba/janela igual a sendBeacon,
+    // mas funciona corretamente através de Cloudflare (sendBeacon era descartado silenciosamente).
+    var data = JSON.stringify(Object.assign({ api_key: apiKey }, body));
+    try {
+      fetch(apiBase + '/v1/collect/heartbeat', {
+        method:    'POST',
+        headers:   { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+        body:      data,
+        keepalive: true,
+      }).catch(function () {});
+    } catch (e) {
+      try {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', apiBase + '/v1/collect/heartbeat', !isFinal);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.setRequestHeader('X-API-Key', apiKey);
+        xhr.send(data);
+      } catch (e2) {}
     }
     if (!isFinal) startEngaged();
   }
@@ -264,7 +307,60 @@
   }
 
   scheduleHeartbeat();
-  window.addEventListener('beforeunload', function () { sendHeartbeat(true); });
+
+  // ── Encerramento confiável da sessão ──────────────────────────────────────
+  // Usa três eventos complementares para cobrir todos os cenários:
+  // - beforeunload: desktop/tab close (mas não confiável em mobile)
+  // - pagehide: mobile + bfcache (mais confiável que beforeunload)
+  // - visibilitychange:hidden: app background em mobile, troca de aba
+  // Guard finalSent evita envio duplo.
+
+  var finalSent = false;
+
+  function sendFinalHeartbeat() {
+    if (finalSent) return;
+    finalSent = true;
+    clearTimeout(heartbeatTimer);
+    clearTimeout(interactionTimer);
+    sendHeartbeat(true);
+  }
+
+  window.addEventListener('beforeunload', sendFinalHeartbeat);
+  window.addEventListener('pagehide',     sendFinalHeartbeat);
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') {
+      pauseEngaged();
+      sendFinalHeartbeat();
+    } else {
+      // Página voltou a ficar visível — reseta guard e retoma heartbeat
+      finalSent = false;
+      startEngaged();
+      lastHeartbeatTs = 0; // força heartbeat de interação imediato se necessário
+      scheduleHeartbeat();
+    }
+  });
+
+  // ── Session readiness gate ────────────────────────────────────────────────
+  // Pageload rules fire events immediately; collectSession() is async.
+  // We queue rule fires until the session POST is confirmed so the event
+  // INSERT never races against the session INSERT (FK violation fix).
+
+  var sessionReady       = false;
+  var _pendingRuleFires  = [];
+
+  function onSessionReady() {
+    if (sessionReady) return;
+    sessionReady = true;
+
+    // Dispara pageview do carregamento inicial da página.
+    // Navegações SPA já são tratadas pelo _navListeners abaixo.
+    // Isso popula events WHERE name='pageview', usado no funil de conversão.
+    window.ConvTrack.track('pageview', { url: window.location.href });
+
+    var pending = _pendingRuleFires.splice(0);
+    pending.forEach(function (fn) { try { fn(); } catch (e) {} });
+  }
 
   // ── Send session to API ───────────────────────────────────────────────────
 
@@ -288,13 +384,18 @@
     })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (data) {
+        // Sessão confirmada no banco — libera eventos de regras na fila
+        onSessionReady();
         // Camada 4 — clone detection via resposta da API (DomainCheck middleware)
         if (data && data.clone_detected && data.redirect_url) {
           try { document.body.style.display = 'none'; } catch (e) {}
           window.location.replace(data.redirect_url);
         }
       })
-      .catch(function () {});
+      .catch(function () {
+        // Mesmo em erro de rede, desbloqueamos os eventos (FK foi removida na migration 015)
+        onSessionReady();
+      });
   }
 
   collectSession();
@@ -707,6 +808,12 @@
         rule_name: rule.name,
         url:       window.location.href,
       });
+
+      // Sempre registra o evento (visível na seção Eventos do dashboard).
+      // Independe de fire_conversion — o usuário deve ver o disparo em Eventos.
+      window.ConvTrack.track(rule.event_name, props);
+
+      // Se fire_conversion=true, dispara também a conversão (para CAPI, Conversões, etc.)
       if (rule.fire_conversion) {
         send('/v1/collect/conversion', {
           session_id: sessionId,
@@ -715,8 +822,6 @@
           value:      props.value    || 0,
           currency:   props.currency || 'BRL',
         });
-      } else {
-        window.ConvTrack.track(rule.event_name, props);
       }
     }
 
@@ -738,22 +843,37 @@
 
         switch (rule.type) {
 
-          // pageload: dispara toda vez que a URL bater (incluindo navegações SPA)
+          // pageload: dispara toda vez que a URL bater (incluindo navegações SPA).
+          // Na primeira carga, aguarda confirmação da sessão antes de enviar o evento
+          // para evitar race condition (evento chega ao servidor antes da sessão existir).
           case 'pageload':
-            if (matchesURL(rule.url_pattern)) fireRule(rule);
+            if (matchesURL(rule.url_pattern)) {
+              if (sessionReady) {
+                fireRule(rule);
+              } else {
+                // Guarda referência ao rule para fechar o closure corretamente
+                (function (r) {
+                  _pendingRuleFires.push(function () { fireRule(r); });
+                })(rule);
+              }
+            }
             break;
 
-          // click: listener global adicionado UMA vez; revalida URL em cada clique
+          // click: listener em CAPTURE phase (true) para garantir que
+          // stopPropagation() no código do site não engula o evento.
           case 'click':
             if (!rule.selector) return;
             if (_listenersAdded[rule.id]) return;
             _listenersAdded[rule.id] = true;
-            document.addEventListener('click', function (e) {
-              if (!matchesURL(rule.url_pattern)) return; // FIX #5
-              try {
-                if (e.target.matches(rule.selector) || e.target.closest(rule.selector)) fireRule(rule);
-              } catch (ex) {}
-            });
+            (function (r) {
+              document.addEventListener('click', function (e) {
+                if (!matchesURL(r.url_pattern)) return;
+                try {
+                  var t = e.target;
+                  if (t && (t.matches(r.selector) || t.closest(r.selector))) fireRule(r);
+                } catch (ex) {}
+              }, true); // capture phase — não depende de bubbling
+            })(rule);
             break;
 
           // visibility: observer adicionado UMA vez; fired-flag por pathname
@@ -817,17 +937,17 @@
             })();
             break;
 
-          // submit: listener global adicionado UMA vez; revalida URL em cada submit
+          // submit: listener em CAPTURE phase para não depender de bubbling
           case 'submit':
             if (_listenersAdded[rule.id]) return;
             _listenersAdded[rule.id] = true;
-            (function () {
-              var sel = rule.selector || 'form';
+            (function (r) {
+              var sel = r.selector || 'form';
               document.addEventListener('submit', function (e) {
-                if (!matchesURL(rule.url_pattern)) return; // FIX #5
-                try { if (e.target.matches(sel)) fireRule(rule); } catch (ex) {}
-              });
-            })();
+                if (!matchesURL(r.url_pattern)) return;
+                try { if (e.target.matches(sel)) fireRule(r); } catch (ex) {}
+              }, true); // capture phase
+            })(rule);
             break;
         }
       });

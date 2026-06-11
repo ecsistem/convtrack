@@ -63,6 +63,8 @@ type Session struct {
 	InputCount      int        `json:"input_count" db:"input_count"`
 	ScrollDepthPct  int        `json:"scroll_depth_pct" db:"scroll_depth_pct"`
 	RageClicks      int        `json:"rage_clicks" db:"rage_clicks"`
+	// Session end (migration 014)
+	EndedAt         *time.Time `json:"ended_at,omitempty" db:"ended_at"`
 	// Computed — joined in dashboard queries
 	TimeToPurchase  *int       `json:"time_to_purchase,omitempty"`
 	UTMSource       string     `json:"utm_source"`
