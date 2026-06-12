@@ -33,6 +33,35 @@ services:
       timeout: 3s
       retries: 5
 
+  # ── Caddy — reverse proxy + On-Demand TLS para domínios de clientes ─────────
+  # Em desenvolvimento: comente ou remova este serviço (acesse a API na porta 8080).
+  # Em produção: exponha apenas as portas 80/443; remova "8080:8080" do serviço api.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"     # HTTP/3 (QUIC)
+    environment:
+      # Domínio principal da API — Caddy emite cert estático para ele
+      CADDY_DOMAIN: ${CADDY_DOMAIN:-localhost}
+      # E-mail para notificações Let's Encrypt
+      CADDY_EMAIL:  ${CADDY_EMAIL:-ssl@convtrack.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data        # certs Let's Encrypt (persistidos)
+      - caddy_config:/config    # estado interno do Caddy
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/health 2>/dev/null | grep -q ok || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   # ── API + migrator automático ─────────────────────────────────────────────
   # As migrations são embutidas no binário (go:embed).
   # Na inicialização, o app detecta e aplica automaticamente todas as pendentes.
@@ -42,6 +71,8 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
+      # Em produção com Caddy: remova esta linha — API só é acessível internamente.
+      # Em desenvolvimento sem Caddy: mantenha para acesso direto.
       - "8080:8080"
     environment:
       # ── Banco ──────────────────────────────────────────────────────
@@ -113,3 +144,5 @@ services:
 volumes:
   pgdata:
   redisdata:
+  caddy_data:     # certs Let's Encrypt — NUNCA apague em produção
+  caddy_config:   # estado interno do Caddy

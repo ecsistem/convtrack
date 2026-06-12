@@ -26,16 +26,20 @@ func sanitizeSlug(s string) string {
 
 // Campaign define as URLs e parâmetros de uma campanha de proteção.
 type Campaign struct {
-	ID        uuid.UUID `json:"id"         db:"id"`
-	ProjectID uuid.UUID `json:"project_id" db:"project_id"`
-	Name      string    `json:"name"       db:"name"`
-	Slug      string    `json:"slug"       db:"slug"`       // /slug na URL principal (ex: convtrack.com/minha-oferta)
-	SafeURL   string    `json:"safe_url"   db:"safe_url"`   // exibida para bots/revisores
-	MoneyURL  string    `json:"money_url"  db:"money_url"`  // exibida para humanos reais
-	SplitPct  int       `json:"split_pct"  db:"split_pct"`  // % de humanos → money_url
-	Enabled   bool      `json:"enabled"    db:"enabled"`
-	CreatedAt time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
+	ID            uuid.UUID `json:"id"             db:"id"`
+	ProjectID     uuid.UUID `json:"project_id"     db:"project_id"`
+	Name          string    `json:"name"           db:"name"`
+	Slug          string    `json:"slug"           db:"slug"`            // /slug na URL principal
+	SafeURL       string    `json:"safe_url"       db:"safe_url"`        // exibida para bots/revisores
+	MoneyURL      string    `json:"money_url"      db:"money_url"`       // exibida para humanos reais
+	SplitPct      int       `json:"split_pct"      db:"split_pct"`       // % de humanos → money_url
+	Enabled       bool      `json:"enabled"        db:"enabled"`
+	Platform      string    `json:"platform"       db:"platform"`        // meta|tiktok|kwai|google|taboola|manual
+	ChallengeMode string    `json:"challenge_mode" db:"challenge_mode"`  // redirect|captcha|both
+	RequireKey    bool      `json:"require_key"    db:"require_key"`     // exige ?_sk=access_key
+	AccessKey     string    `json:"access_key"     db:"access_key"`      // chave secreta gerada
+	CreatedAt     time.Time `json:"created_at"     db:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"     db:"updated_at"`
 }
 
 // Domain mapeia um hostname a uma campanha (para o proxy reverso).
@@ -57,10 +61,16 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 		c.SplitPct = 100
 	}
 	c.Slug = sanitizeSlug(c.Slug)
+	if c.ChallengeMode == "" {
+		c.ChallengeMode = "redirect"
+	}
 	_, err := s.db.Exec(ctx, `
-		INSERT INTO shield_campaigns (id, project_id, name, slug, safe_url, money_url, split_pct, enabled)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		INSERT INTO shield_campaigns
+		  (id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
+		   platform, challenge_mode, require_key, access_key)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 		c.ID, c.ProjectID, c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
+		c.Platform, c.ChallengeMode, c.RequireKey, c.AccessKey,
 	)
 	if err != nil {
 		return nil, err
@@ -72,7 +82,8 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 
 func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Campaign, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled, created_at, updated_at
+		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
+		       platform, challenge_mode, require_key, access_key, created_at, updated_at
 		FROM shield_campaigns WHERE project_id = $1 ORDER BY created_at DESC`, projectID)
 	if err != nil {
 		return nil, err
@@ -83,7 +94,8 @@ func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Cam
 	for rows.Next() {
 		var c Campaign
 		if err := rows.Scan(&c.ID, &c.ProjectID, &c.Name, &c.Slug, &c.SafeURL, &c.MoneyURL,
-			&c.SplitPct, &c.Enabled, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.SplitPct, &c.Enabled, &c.Platform, &c.ChallengeMode,
+			&c.RequireKey, &c.AccessKey, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			continue
 		}
 		list = append(list, c)
@@ -99,11 +111,16 @@ func (s *Service) UpdateCampaign(ctx context.Context, c *Campaign) error {
 		c.SplitPct = 100
 	}
 	c.Slug = sanitizeSlug(c.Slug)
+	if c.ChallengeMode == "" {
+		c.ChallengeMode = "redirect"
+	}
 	_, err := s.db.Exec(ctx, `
 		UPDATE shield_campaigns
-		SET name=$1, slug=$2, safe_url=$3, money_url=$4, split_pct=$5, enabled=$6, updated_at=NOW()
-		WHERE id=$7 AND project_id=$8`,
-		c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled, c.ID, c.ProjectID,
+		SET name=$1, slug=$2, safe_url=$3, money_url=$4, split_pct=$5, enabled=$6,
+		    platform=$7, challenge_mode=$8, require_key=$9, access_key=$10, updated_at=NOW()
+		WHERE id=$11 AND project_id=$12`,
+		c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
+		c.Platform, c.ChallengeMode, c.RequireKey, c.AccessKey, c.ID, c.ProjectID,
 	)
 	return err
 }
@@ -159,6 +176,18 @@ func (s *Service) CreateDomain(ctx context.Context, d *Domain) (*Domain, error) 
 		_ = s.rdb.Del(ctx, "shield_domain:"+d.Domain)
 	}
 	return d, nil
+}
+
+// IsDomainSSLEnabled verifica se o domínio está cadastrado E com ssl_enabled=true.
+// Usado pelo endpoint ask do Caddy On-Demand TLS — retorna false para domínios
+// desconhecidos ou sem SSL, impedindo emissão não autorizada de certificados.
+func (s *Service) IsDomainSSLEnabled(ctx context.Context, domain string) bool {
+	var ok bool
+	_ = s.db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM shield_domains WHERE domain=$1 AND ssl_enabled=true)`,
+		domain,
+	).Scan(&ok)
+	return ok
 }
 
 func (s *Service) DeleteDomain(ctx context.Context, id, projectID uuid.UUID) error {
@@ -225,11 +254,13 @@ func (s *Service) ResolveCampaignBySlug(ctx context.Context, slug string) (*Camp
 
 	var c Campaign
 	err := s.db.QueryRow(ctx, `
-		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled, created_at, updated_at
+		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
+		       platform, challenge_mode, require_key, access_key, created_at, updated_at
 		FROM shield_campaigns
 		WHERE slug = $1 AND enabled = true`, slug,
 	).Scan(&c.ID, &c.ProjectID, &c.Name, &c.Slug, &c.SafeURL, &c.MoneyURL,
-		&c.SplitPct, &c.Enabled, &c.CreatedAt, &c.UpdatedAt)
+		&c.SplitPct, &c.Enabled, &c.Platform, &c.ChallengeMode,
+		&c.RequireKey, &c.AccessKey, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}

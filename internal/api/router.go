@@ -177,12 +177,18 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	// Script de fingerprinting (sem auth)
 	app.Get("/shield-fp.js", shieldH.ServeFPScript)
 
+	// Caddy On-Demand TLS — ask endpoint (interno, sem auth)
+	// Caddy chama GET /v1/shield/domain-ask?domain=X antes de emitir cert.
+	// Só acessível via rede interna Docker; não exposto diretamente ao público.
+	app.Get("/v1/shield/domain-ask", shieldH.DomainAsk)
+
 	// Smart redirect avançado (fingerprinting + A/B, server-side)
 	app.Get("/r/:projectKey", apiKeyAuth, shieldH.SmartRedirectAdvanced)
 
 	// Slug cloaker — /:slug (sem autenticação, público)
 	// Deve ficar antes do catch-all de domínio mas após rotas fixas
 	app.Get("/:slug", shieldH.SlugCloak)
+	app.Post("/:slug/verify", shieldH.VerifyCaptcha) // CAPTCHA verification
 
 	// ── Shield dashboard (JWT) ─────────────────────────────────────────────────
 	dash.Get("/shield/config",             shieldH.GetConfig)
@@ -197,9 +203,10 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	dash.Put("/shield/campaigns/:id",      shieldH.UpdateCampaign)
 	dash.Delete("/shield/campaigns/:id",   shieldH.DeleteCampaign)
 	// Domínios
-	dash.Get("/shield/domains",            shieldH.ListDomains)
-	dash.Post("/shield/domains",           shieldH.CreateDomain)
-	dash.Delete("/shield/domains/:id",     shieldH.DeleteDomain)
+	dash.Get("/shield/domains",              shieldH.ListDomains)
+	dash.Post("/shield/domains",             shieldH.CreateDomain)
+	dash.Get("/shield/domains/:id/check",    shieldH.CheckDomain)
+	dash.Delete("/shield/domains/:id",       shieldH.DeleteDomain)
 	// Webhooks
 	dash.Get("/shield/webhooks",                shieldH.ListWebhooks)
 	dash.Post("/shield/webhooks",               shieldH.CreateWebhook)

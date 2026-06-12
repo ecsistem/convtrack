@@ -1,5 +1,8 @@
-/* ConvTrack tracker.js v2.9.0
+/* ConvTrack tracker.js v3.0.0
  * Bundled: rrweb (session replay) + disable-devtool (anti-devtools) + shield-fp (fingerprinting)
+ * v3.0.0: advanced behavior collection (mouse, scroll, keyboard, CTA) +
+ *         full fingerprint (Canvas, WebGL, Audio, Battery, Permissions, WebRTC,
+ *         screen, math constants, global pollution, protocol check, error stack)
  * Single script tag — no other external dependencies required.
  */
 
@@ -161,7 +164,7 @@ rrweb/dist/rrweb.js:
 (function (window, document) {
   'use strict';
 
-  var CT_VERSION      = '2.9.0';
+  var CT_VERSION      = '3.0.0';
   var STORAGE_VISITOR = 'ct_vid';
   var STORAGE_SESSION = 'ct_sid';
   var STORAGE_ATTR    = 'ct_attr';
@@ -1171,6 +1174,486 @@ rrweb/dist/rrweb.js:
     // FIX #2: registra callback no dispatcher unificado (não re-patcha pushState)
     _navListeners.push(function () {
       setTimeout(function () { loadRules(applyRules); }, 50);
+    });
+
+  })();
+
+
+  // ── Advanced Behavior & Fingerprint Collection ────────────────────────────
+  // Coleta sinais comportamentais (mouse, scroll, teclado, CTAs) + fingerprint
+  // avançado (Canvas, WebGL, Audio, Battery, Permissions, WebRTC, screen, math, etc.)
+  // Envia como evento "enhanced_behavior" → /v1/collect/event.
+  // v3.0.0
+
+  (function initAdvancedBehavior() {
+
+    // Respeita opt-out: doNotTrack, cookie pc_optout=1 ou localStorage ct_optout
+    try {
+      if (navigator.doNotTrack === '1') return;
+      if (document.cookie.indexOf('ct_optout=1') !== -1) return;
+      if (localStorage.getItem('ct_optout') === '1') return;
+    } catch (e) {}
+
+    // ── Comportamento: estado compartilhado ──────────────────────────────────
+    var _mouseSamples  = [];
+    var _mouseMoveCount = 0;
+    var _scrollSamples = [];
+    var _keySamples    = [];
+    var _ctaClicks     = [];
+    var _ctaCount      = 0;
+    var _firstClickMs  = 0;
+    var _advData       = null;
+    var _advSent       = false;
+    var MAX_MOUSE   = 100;
+    var MAX_SCROLL  = 100;
+    var MAX_KEYS    = 40;
+    var MAX_CTA     = 80;
+
+    function _bNow() {
+      try { return Math.round(performance.now()); } catch (e) { return Date.now() - sessionStartTs; }
+    }
+    function _elText(n) {
+      try { return ((n.innerText || n.value || '').replace(/\s+/g, ' ').trim()).slice(0, 80); } catch (e) { return ''; }
+    }
+    function _elHref(n) {
+      try {
+        if (n && n.href) return String(n.href).slice(0, 512);
+        var a = n && n.closest ? n.closest('a[href]') : null;
+        return a && a.href ? String(a.href).slice(0, 512) : '';
+      } catch (e) { return ''; }
+    }
+
+    // ── Listeners comportamentais ────────────────────────────────────────────
+
+    document.addEventListener('mousemove', function (ev) {
+      _mouseMoveCount++;
+      if (_mouseSamples.length < MAX_MOUSE) {
+        _mouseSamples.push({ x: ev.clientX, y: ev.clientY, t: _bNow() });
+      }
+    }, { passive: true });
+
+    window.addEventListener('scroll', function () {
+      try {
+        var y = Math.round(window.pageYOffset || window.scrollY || 0);
+        if (_scrollSamples.length < MAX_SCROLL) {
+          _scrollSamples.push({ y: y, t: _bNow() });
+        }
+      } catch (e) {}
+    }, { passive: true });
+
+    document.addEventListener('keydown', function (ev) {
+      if (_keySamples.length < MAX_KEYS) {
+        var k = ev.key || '';
+        _keySamples.push({ k: k.length === 1 ? 'c' : k.slice(0, 3) || '?', t: _bNow() });
+      }
+    }, { passive: true });
+
+    // CTA click: captura cliques em a/button/[role=button]/input[submit|button]
+    document.addEventListener('click', function (ev) {
+      if (!_firstClickMs) _firstClickMs = _bNow();
+      var n = ev.target;
+      while (n && n !== document.body) {
+        var tg = (n.tagName || '').toLowerCase();
+        var role = n.getAttribute ? n.getAttribute('role') : '';
+        var itype = (n.type || '').toLowerCase();
+        if (tg === 'a' || tg === 'button' || role === 'button' ||
+            (tg === 'input' && (itype === 'submit' || itype === 'button'))) {
+          _ctaCount++;
+          var ce = { t: _bNow(), el: tg, txt: _elText(n), href: _elHref(n) };
+          if (_ctaClicks.length < MAX_CTA) _ctaClicks.push(ce);
+          // Beacon imediato para cada clique em CTA (captura intenção)
+          send('/v1/collect/event', {
+            session_id: sessionId,
+            name: 'cta_click',
+            properties: { element: tg, text: ce.txt, href: ce.href, cta_n: _ctaCount },
+          });
+          break;
+        }
+        n = n.parentElement;
+      }
+    }, true);
+
+    // ── Fingerprint helpers ──────────────────────────────────────────────────
+
+    function _h(s) {
+      try {
+        var h = 0; s = String(s || '');
+        for (var i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h |= 0; }
+        return h.toString(36);
+      } catch (e) { return 'err'; }
+    }
+
+    function _screenSig() {
+      try {
+        return {
+          w: screen.width, h: screen.height,
+          aw: screen.availWidth, ah: screen.availHeight, cd: screen.colorDepth,
+          x: { eq: screen.width === innerWidth && screen.height === innerHeight, sm: screen.width < 800 || screen.height < 600 },
+        };
+      } catch (e) { return {}; }
+    }
+
+    function _winSig() {
+      try {
+        return {
+          iw: innerWidth, ih: innerHeight,
+          ow: outerWidth, oh: outerHeight,
+          nc: outerWidth === innerWidth && outerHeight === innerHeight,
+        };
+      } catch (e) { return {}; }
+    }
+
+    function _locSig() {
+      try {
+        var langs = navigator.languages ? Array.prototype.slice.call(navigator.languages, 0, 8) : [];
+        return {
+          lg: navigator.language,
+          ls: langs,
+          tz: Intl && Intl.DateTimeFormat ? Intl.DateTimeFormat().resolvedOptions().timeZone : '',
+          to: new Date().getTimezoneOffset(),
+          x: { sl: langs.length === 1, lm: langs.indexOf(navigator.language) === -1 },
+        };
+      } catch (e) { return {}; }
+    }
+
+    function _navSig() {
+      try {
+        return {
+          p: navigator.platform, v: navigator.vendor,
+          mt: navigator.maxTouchPoints || 0,
+          hc: navigator.hardwareConcurrency || 0,
+          dm: navigator.deviceMemory || 0,
+          x: {
+            wd: !!navigator.webdriver,
+            cv: /chrome/i.test(navigator.userAgent) && !/google/i.test(navigator.vendor || ''),
+            mn: /mobile|android|iphone|ipad/i.test(navigator.userAgent) && !(navigator.maxTouchPoints > 0),
+          },
+        };
+      } catch (e) { return {}; }
+    }
+
+    function _canvasSig() {
+      try {
+        var c = document.createElement('canvas');
+        c.width = 180; c.height = 40;
+        var x = c.getContext('2d');
+        if (!x) return { s: false };
+        x.textBaseline = 'top'; x.font = '14px Arial';
+        x.fillStyle = '#f60'; x.fillRect(0, 0, 180, 40);
+        x.fillStyle = '#069';
+        x.fillText('ct:' + apiKey.slice(0, 12) + ':' + navigator.userAgent.slice(0, 18), 4, 7);
+        x.strokeStyle = 'rgba(120,30,90,.7)';
+        x.arc(90, 20, 12, 0, Math.PI * 2); x.stroke();
+        var data = c.toDataURL();
+        return { s: true, h: _h(data), l: data.length };
+      } catch (e) { return { s: false }; }
+    }
+
+    function _webglSig() {
+      try {
+        var c = document.createElement('canvas');
+        var gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+        if (!gl) return { s: false };
+        var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+        var vendor   = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL)   : gl.getParameter(gl.VENDOR);
+        var renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+        var ex = gl.getSupportedExtensions() || [];
+        return { s: true, v: String(vendor || '').slice(0, 120), r: String(renderer || '').slice(0, 180), eh: _h(ex.join('|')), ec: ex.length };
+      } catch (e) { return { s: false }; }
+    }
+
+    function _audioSig() {
+      return new Promise(function (res) {
+        try {
+          var OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+          if (!OAC) return res({ s: false });
+          var ctx = new OAC(1, 4410, 44100);
+          var osc = ctx.createOscillator();
+          var comp = ctx.createDynamicsCompressor();
+          osc.type = 'triangle'; osc.frequency.value = 10000;
+          comp.threshold.value = -50; comp.knee.value = 40;
+          comp.ratio.value = 12; comp.attack.value = 0; comp.release.value = 0.25;
+          osc.connect(comp); comp.connect(ctx.destination);
+          osc.start(0);
+          ctx.startRendering().then(function (buf) {
+            var data = buf.getChannelData(0);
+            var sum = 0;
+            for (var i = 0; i < data.length; i += 100) sum += Math.abs(data[i] || 0);
+            res({ s: true, h: _h(sum.toFixed(8)) });
+          }).catch(function () { res({ s: false }); });
+        } catch (e) { res({ s: false }); }
+      });
+    }
+
+    function _batterySig() {
+      return new Promise(function (res) {
+        try {
+          if (!navigator.getBattery) return res({ s: false });
+          navigator.getBattery().then(function (b) {
+            res({ s: true, c: b.charging, l: Math.round(b.level * 100) });
+          }).catch(function () { res({ s: false }); });
+        } catch (e) { res({ s: false }); }
+      });
+    }
+
+    function _permSig() {
+      return new Promise(function (res) {
+        try {
+          var P = navigator.permissions;
+          if (!P) return res({ s: false });
+          Promise.all(['notifications', 'geolocation'].map(function (n) {
+            return P.query({ name: n }).then(function (x) { return [n, x.state]; }).catch(function () { return [n, 'err']; });
+          })).then(function (r) {
+            var o = { s: true };
+            r.forEach(function (x) { o[x[0].slice(0, 2)] = x[1]; });
+            res(o);
+          });
+        } catch (e) { res({ s: false }); }
+      });
+    }
+
+    function _mediaSig() {
+      return new Promise(function (res) {
+        try {
+          var M = navigator.mediaDevices;
+          if (!M || !M.enumerateDevices) return res({ s: false });
+          M.enumerateDevices().then(function (devices) {
+            res({ s: true, c: devices.length, nd: devices.length === 0, k: devices.map(function (x) { return x.kind; }).slice(0, 12) });
+          }).catch(function () { res({ s: false }); });
+        } catch (e) { res({ s: false }); }
+      });
+    }
+
+    function _webrtcSig() {
+      return new Promise(function (res) {
+        try {
+          var R = window.RTCPeerConnection || window.mozRTCPeerConnection || window.webkitRTCPeerConnection;
+          if (!R) return res({ s: false });
+          var pc = new R({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+          var ips = [], done = false;
+          function finish() {
+            if (done) return; done = true;
+            try { pc.close(); } catch (ex) {}
+            res({ s: true, ips: ips.slice(0, 8) });
+          }
+          pc.createDataChannel('ct');
+          pc.onicecandidate = function (ev) {
+            try {
+              if (!ev || !ev.candidate) return finish();
+              var m = String(ev.candidate.candidate || '').match(/(\d+\.\d+\.\d+\.\d+)/);
+              if (m && ips.indexOf(m[1]) === -1) ips.push(m[1]);
+            } catch (ex) {}
+          };
+          pc.createOffer().then(function (of) { return pc.setLocalDescription(of); }).catch(finish);
+          setTimeout(finish, 1200);
+        } catch (e) { res({ s: false }); }
+      });
+    }
+
+    function _connSig() {
+      try {
+        var c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+        if (!c) return { s: false };
+        return { s: true, et: c.effectiveType, dl: c.downlink, rt: c.rtt, sd: c.saveData };
+      } catch (e) { return { s: false }; }
+    }
+
+    function _mathSig() {
+      try {
+        return {
+          t1: Math.tan(-1e300), s1: Math.sin(1), c1: Math.cos(1),
+          l2: Math.log(2),     sq: Math.sqrt(2), at: Math.atan2(1, 1),
+        };
+      } catch (e) { return {}; }
+    }
+
+    function _protoSig() {
+      try {
+        var F = Function.prototype.toString;
+        return {
+          td: F.call(HTMLCanvasElement.prototype.toDataURL).indexOf('[native code]') > -1,
+          gc: F.call(HTMLCanvasElement.prototype.getContext).indexOf('[native code]') > -1,
+        };
+      } catch (e) { return {}; }
+    }
+
+    function _errSig() {
+      try {
+        var s = (new Error('x')).stack || '';
+        return { f: s.indexOf('    at ') !== -1 ? 'v8' : s.indexOf('@') !== -1 ? 'sm' : 'jsc', l: s.length };
+      } catch (e) { return {}; }
+    }
+
+    // Detecta globais injetados por automação (Selenium, Puppeteer, CDP, etc.)
+    function _globalPollution() {
+      try {
+        var markers = [
+          '__phantomas', '__nightmare', '__selenium', 'callPhantom', '_phantom',
+          '__webdriver_script_fn', 'domAutomation', 'domAutomationController',
+          'fxdriver_id', '__fxdriver_evaluate', '_Selenium_IDE_Recorder',
+          'webdriverFunctions', '__webdriverFunc',
+        ];
+        var found = [];
+        for (var i = 0; i < markers.length; i++) {
+          if (typeof window[markers[i]] !== 'undefined') found.push(markers[i]);
+        }
+        try {
+          var wk = Object.keys(window);
+          for (var j = 0; j < wk.length; j++) {
+            var wkj = wk[j];
+            if (wkj.indexOf('cdc_') === 0 || wkj.indexOf('$cdc') === 0 ||
+                wkj.indexOf('__pp') === 0 || wkj.indexOf('__cg') === 0) {
+              found.push(wkj);
+            }
+          }
+        } catch (ex) {}
+        return { c: found.length, p: found.slice(0, 6) };
+      } catch (e) { return { c: 0 }; }
+    }
+
+    function _miscSig() {
+      try {
+        return {
+          ch: !!(window.chrome && (window.chrome.runtime || window.chrome.loadTimes || window.chrome.csi)),
+          ff: typeof InstallTrigger !== 'undefined',
+          nt: typeof Notification !== 'undefined' ? Notification.permission : null,
+          pl: navigator.plugins ? navigator.plugins.length : 0,
+          mi: navigator.mimeTypes ? navigator.mimeTypes.length : 0,
+        };
+      } catch (e) { return {}; }
+    }
+
+    // Performance timing — detecta ambientes automatizados (zero-DNS, zero-TCP, carga < 100ms)
+    function _perfSig() {
+      try {
+        var t = performance.timing;
+        if (t && t.navigationStart && t.loadEventEnd > 0) {
+          var dns = t.domainLookupEnd - t.domainLookupStart;
+          var tcp = t.connectEnd - t.connectStart;
+          var total = t.loadEventEnd - t.navigationStart;
+          return {
+            s:   true,
+            dc:  t.domContentLoadedEventEnd - t.navigationStart,
+            lc:  total,
+            x:   { zd: dns === 0, zt: tcp === 0, fl: total < 100 },
+          };
+        }
+        var nav = performance.getEntriesByType && performance.getEntriesByType('navigation')[0];
+        if (nav) {
+          return {
+            s:  true,
+            dc: Math.round(nav.domContentLoadedEventEnd),
+            lc: Math.round(nav.loadEventEnd),
+            x:  { fl: nav.loadEventEnd < 100 },
+          };
+        }
+        return { s: false };
+      } catch (e) { return { s: false }; }
+    }
+
+    // ── collectAdvanced: coleta todos os sinais assíncronos em paralelo ──────
+    function _collectAdvanced() {
+      var base = {
+        wd: !!navigator.webdriver,
+        i:  _screenSig(),
+        j:  _winSig(),
+        l:  _locSig(),
+        m:  _navSig(),
+        pc: _canvasSig(),
+        wg: _webglSig(),
+        dp: _globalPollution(),
+        me: _mathSig(),
+        q:  _connSig(),
+        pi: _protoSig(),
+        es: _errSig(),
+        ms: _miscSig(),
+        pf: _perfSig(),
+      };
+      return Promise.all([
+        _webrtcSig(), _batterySig(), _permSig(), _mediaSig(), _audioSig(),
+      ]).then(function (r) {
+        base.g  = r[0]; // WebRTC IPs
+        base.bt = r[1]; // Battery
+        base.pm = r[2]; // Permissions
+        base.md = r[3]; // Media devices
+        base.au = r[4]; // Audio fingerprint
+        return base;
+      }).catch(function () { return base; });
+    }
+
+    // ── Envio do evento enhanced_behavior ────────────────────────────────────
+    function _sendEnhanced() {
+      if (_advSent) return;
+      _advSent = true;
+
+      var props = {
+        // Comportamento
+        mouse_moves:   _mouseMoveCount,
+        mouse_samples: _mouseSamples.slice(0, 30),
+        scroll_max_px: Math.round((scrollDepthPct / 100) * (document.documentElement.scrollHeight || 0)),
+        scroll_pct:    scrollDepthPct,
+        scroll_samples: _scrollSamples.slice(0, 30),
+        key_count:     _keySamples.length,
+        key_samples:   _keySamples,
+        cta_count:     _ctaCount,
+        cta_clicks:    _ctaClicks.slice(0, 20),
+        first_click_ms: _firstClickMs,
+        no_interaction: _mouseMoveCount === 0 && _ctaCount === 0,
+        duration_ms:   Date.now() - sessionStartTs,
+        page_count:    pageCount,
+      };
+
+      // Mescla dados do fingerprint avançado
+      if (_advData) {
+        for (var k in _advData) {
+          if (Object.prototype.hasOwnProperty.call(_advData, k)) {
+            props[k] = _advData[k];
+          }
+        }
+      }
+
+      send('/v1/collect/event', {
+        session_id: sessionId,
+        name:       'enhanced_behavior',
+        properties: props,
+      });
+    }
+
+    // ── Reset para navegação SPA ──────────────────────────────────────────────
+    function _reset() {
+      _mouseSamples = []; _mouseMoveCount = 0;
+      _scrollSamples = [];
+      _keySamples = [];
+      _ctaClicks = []; _ctaCount = 0; _firstClickMs = 0;
+      _advSent = false; _advData = null;
+      // Re-coleta fingerprint na nova página
+      setTimeout(function () {
+        _collectAdvanced().then(function (adv) { _advData = adv; });
+      }, 200);
+    }
+
+    _navListeners.push(_reset);
+
+    // ── Inicialização ─────────────────────────────────────────────────────────
+    // Coleta fingerprint e envia enhanced_behavior assim que pronto
+    _collectAdvanced().then(function (adv) {
+      _advData = adv;
+      // Não envia imediatamente — aguarda alguma interação ou timeout
+    });
+
+    // Fallback: envia com os dados disponíveis após 3.5s
+    setTimeout(function () { _sendEnhanced(); }, 3500);
+
+    // Envia no exit (integra com o sendFinalHeartbeat existente)
+    var _origFinal = window.__ctSendFinal;
+    window.__ctSendFinal = function () {
+      _sendEnhanced();
+      if (_origFinal) _origFinal();
+    };
+    // Hook nas saídas de página
+    window.addEventListener('pagehide', _sendEnhanced);
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') _sendEnhanced();
     });
 
   })();

@@ -1,0 +1,52 @@
+# ── ConvTrack — Caddy reverse proxy com On-Demand TLS ──────────────────────
+#
+# Variáveis de ambiente esperadas:
+#   CADDY_DOMAIN   — domínio principal da API  (ex: api.convtrack.com)
+#   CADDY_EMAIL    — e-mail para Let's Encrypt  (ex: ssl@convtrack.com)
+#
+# Fluxo para domínios de clientes:
+#   1. Cliente faz CNAME: oferta.seusite.com → {CADDY_DOMAIN}
+#   2. Visitante acessa https://oferta.seusite.com (primeira vez)
+#   3. Caddy não tem cert → On-Demand TLS ativado
+#   4. Caddy chama ask: GET http://api:8080/v1/shield/domain-ask?domain=oferta.seusite.com
+#   5. Go verifica: domínio existe em shield_domains AND ssl_enabled=true → 200 OK
+#   6. Caddy solicita cert Let's Encrypt via ACME TLS-ALPN-01
+#   7. Cert emitido, conexão estabelecida, request proxiado ao Go app
+#   8. Go DomainProxyMiddleware encontra a campanha e serve o cloaking
+# ────────────────────────────────────────────────────────────────────────────
+
+{
+	# E-mail para notificações Let's Encrypt (obrigatório em produção)
+	email {$CADDY_EMAIL:ssl@convtrack.com}
+
+	# On-Demand TLS — autoriza emissão de cert por domínio específico
+	on_demand_tls {
+		# Ask endpoint: Go verifica se domínio está cadastrado + ssl_enabled=true
+		ask http://api:8080/v1/shield/domain-ask
+
+		# Limita rajadas de emissão (proteção ACME abuse)
+		interval 2m
+		burst    5
+	}
+}
+
+# ── Domínio principal da API ─────────────────────────────────────────────────
+# TLS automático padrão (não usa on_demand — cert estático para o próprio domínio)
+{$CADDY_DOMAIN:localhost} {
+	reverse_proxy api:8080
+}
+
+# ── Catch-all HTTPS — domínios de clientes via CNAME ────────────────────────
+# Qualquer domínio que resolva para este servidor e não seja o domínio principal
+# recebe On-Demand TLS: cert emitido automaticamente na primeira requisição.
+:443 {
+	tls {
+		on_demand
+	}
+	reverse_proxy api:8080
+}
+
+# ── HTTP → HTTPS redirect ────────────────────────────────────────────────────
+:80 {
+	redir https://{host}{uri} 308
+}

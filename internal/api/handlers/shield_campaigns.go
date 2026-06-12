@@ -1,8 +1,12 @@
 package handlers
 
 import (
+	"crypto/tls"
+	"fmt"
+	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ecsistem/convtrack/internal/api/middleware"
 	"github.com/ecsistem/convtrack/internal/shield"
@@ -13,9 +17,14 @@ import (
 // ── Slug cloaker (público — sem autenticação) ─────────────────────────────
 
 // GET /:slug — entrada principal do cloaker por slug.
-// Bots/revisores → safe_url  |  Humanos → money_url.
-// O slug é só um ponto de entrada: redireciona para a raiz da URL destino
-// (não proxia o caminho completo — o domínio próprio faz proxy completo).
+//
+// Fluxo:
+//  1. require_key → se ?_sk ausente/errado → safe_url
+//  2. Bot check → bots → safe_url
+//  3. challenge_mode:
+//     - "redirect" (default): redireciona direto para money/safe
+//     - "captcha":  serve página de CAPTCHA; após resolver → money_url
+//     - "both":     CAPTCHA → após resolver → loading page com fingerprint → money_url
 func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 	slug := c.Params("slug")
 	campaign, err := h.svc.ResolveCampaignBySlug(c.Context(), slug)
@@ -26,38 +35,265 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 	ip := c.IP()
 	ua := c.Get("User-Agent")
 
+	// ── 1. Chave de acesso secreta ──────────────────────────────────────────
+	if campaign.RequireKey && campaign.AccessKey != "" {
+		if c.Query("_sk") != campaign.AccessKey {
+			// Sem a chave → safe_url silenciosamente
+			safeURL := campaign.SafeURL
+			if safeURL == "" {
+				safeURL = "https://google.com"
+			}
+			return c.Redirect(safeURL, fiber.StatusFound)
+		}
+	}
+
+	// ── 2. Bot check ────────────────────────────────────────────────────────
 	result, _ := h.svc.Check(c.Context(), campaign.ProjectID, shield.CheckRequest{
 		IP:        ip,
 		UserAgent: ua,
 	})
 
-	var targetURL string
-	if result == nil || result.Allowed {
-		targetURL, _ = shield.ChooseURL(campaign, ip)
-	} else {
-		// bloqueado: manda para safe_url (ou redirect_url se configurado)
-		if result.RedirectURL != "" {
-			targetURL = result.RedirectURL
-		} else {
-			targetURL = campaign.SafeURL
+	isBot := result != nil && !result.Allowed
+
+	// Bots sempre vão para safe_url — sem CAPTCHA
+	if isBot {
+		safeURL := campaign.SafeURL
+		if result != nil && result.RedirectURL != "" {
+			safeURL = result.RedirectURL
 		}
+		if safeURL == "" {
+			safeURL = "https://google.com"
+		}
+		return c.Redirect(safeURL, fiber.StatusFound)
 	}
 
-	if targetURL == "" {
+	// ── 3. Humano: challenge_mode ───────────────────────────────────────────
+	moneyURL, _ := shield.ChooseURL(campaign, ip)
+	if moneyURL == "" {
 		return c.Status(fiber.StatusNotFound).SendString("campaign not configured")
 	}
 
-	// Repassa query strings originais (UTMs etc.) para a URL destino
-	qs := string(c.Request().URI().QueryString())
+	// Repassa query strings (UTMs etc.) sem _sk para a URL destino
+	qs := buildQS(c, "_sk") // remove _sk antes de repassar
 	if qs != "" {
-		if strings.Contains(targetURL, "?") {
-			targetURL += "&" + qs
+		if strings.Contains(moneyURL, "?") {
+			moneyURL += "&" + qs
 		} else {
-			targetURL += "?" + qs
+			moneyURL += "?" + qs
 		}
 	}
 
-	return c.Redirect(targetURL, fiber.StatusFound)
+	mode := campaign.ChallengeMode
+	if mode == "" {
+		mode = "redirect"
+	}
+
+	switch mode {
+	case "captcha", "both":
+		// Verifica se já passou pelo CAPTCHA (cookie de sessão)
+		cookieName := "ct_cp_" + campaign.ID.String()[:8]
+		cookieVal := c.Cookies(cookieName)
+		if cookieVal == campaign.ID.String()[:16] {
+			// Já resolveu — vai direto para money
+			return c.Redirect(moneyURL, fiber.StatusFound)
+		}
+		// Serve página de CAPTCHA
+		ch := shield.GenerateCaptcha(campaign.ID.String(), campaign.AccessKey)
+		html := buildCaptchaHTML(slug, ch.Question, ch.Token, campaign.Name, moneyURL, mode)
+		c.Set("Content-Type", "text/html; charset=utf-8")
+		c.Set("Cache-Control", "no-store")
+		return c.SendString(html)
+
+	default: // "redirect" — comportamento atual
+		return c.Redirect(moneyURL, fiber.StatusFound)
+	}
+}
+
+// POST /:slug/verify — verifica a resposta do CAPTCHA.
+func (h *ShieldHandler) VerifyCaptcha(c *fiber.Ctx) error {
+	slug := c.Params("slug")
+	campaign, err := h.svc.ResolveCampaignBySlug(c.Context(), slug)
+	if err != nil || campaign == nil {
+		return c.Status(fiber.StatusNotFound).SendString("not found")
+	}
+
+	token  := c.FormValue("token")
+	answer := c.FormValue("answer")
+	next   := c.FormValue("next")   // money_url pré-computada
+	mode   := c.FormValue("mode")   // captcha | both
+
+	if !shield.VerifyCaptcha(token, answer, campaign.ID.String(), campaign.AccessKey) {
+		// Resposta errada → novo desafio com mensagem de erro
+		ch := shield.GenerateCaptcha(campaign.ID.String(), campaign.AccessKey)
+		html := buildCaptchaHTML(slug, ch.Question, ch.Token, campaign.Name, next, mode)
+		html = strings.Replace(html, `id="captcha-error" class="captcha-error hidden"`,
+			`id="captcha-error" class="captcha-error"`, 1)
+		c.Set("Content-Type", "text/html; charset=utf-8")
+		c.Set("Cache-Control", "no-store")
+		return c.SendString(html)
+	}
+
+	// ✅ Correto — seta cookie (1h) para evitar re-verificação
+	cookieName := "ct_cp_" + campaign.ID.String()[:8]
+	c.Cookie(&fiber.Cookie{
+		Name:     cookieName,
+		Value:    campaign.ID.String()[:16],
+		MaxAge:   3600,
+		HTTPOnly: true,
+		SameSite: "Lax",
+	})
+
+	// Para mode=both, mostra loading spinner antes do money URL
+	if mode == "both" {
+		html := buildLoadingHTML(next, campaign.Name)
+		c.Set("Content-Type", "text/html; charset=utf-8")
+		return c.SendString(html)
+	}
+
+	return c.Redirect(next, fiber.StatusFound)
+}
+
+// ── HTML builders ──────────────────────────────────────────────────────────
+
+// buildQS retorna a query string atual excluindo os parâmetros em exclude.
+func buildQS(c *fiber.Ctx, exclude ...string) string {
+	args := c.Request().URI().QueryArgs()
+	var parts []string
+	args.VisitAll(func(k, v []byte) {
+		key := string(k)
+		for _, ex := range exclude {
+			if key == ex {
+				return
+			}
+		}
+		parts = append(parts, key+"="+string(v))
+	})
+	return strings.Join(parts, "&")
+}
+
+// buildCaptchaHTML gera a página HTML do CAPTCHA.
+func buildCaptchaHTML(slug, question, token, campaignName, moneyURL, mode string) string {
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Verificação de Segurança</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+body{
+  background:#09090b;
+  display:flex;align-items:center;justify-content:center;min-height:100%%;
+  background-image:radial-gradient(ellipse at 50%% 0%%,rgba(99,102,241,.12) 0%%,transparent 60%%);
+}
+.card{
+  width:100%%;max-width:420px;margin:24px;
+  background:#18181b;border:1px solid rgba(255,255,255,.08);border-radius:20px;
+  padding:40px 36px;
+  box-shadow:0 24px 48px rgba(0,0,0,.4),0 0 0 1px rgba(255,255,255,.04) inset;
+}
+.shield{
+  width:52px;height:52px;border-radius:14px;
+  background:linear-gradient(135deg,#4f46e5,#7c3aed);
+  display:flex;align-items:center;justify-content:center;
+  font-size:24px;margin:0 auto 24px;
+  box-shadow:0 8px 24px rgba(79,70,229,.35);
+}
+h1{font-size:18px;font-weight:600;color:#f4f4f5;text-align:center;margin-bottom:6px}
+.sub{font-size:13px;color:#71717a;text-align:center;margin-bottom:32px;line-height:1.5}
+.challenge-box{
+  background:#09090b;border:1px solid rgba(255,255,255,.08);border-radius:12px;
+  padding:20px;text-align:center;margin-bottom:24px;
+}
+.question{font-size:22px;font-weight:700;color:#e4e4e7;letter-spacing:-.3px;margin-bottom:16px}
+input[type=number]{
+  width:100%%;height:48px;border-radius:10px;
+  background:#27272a;border:1.5px solid rgba(255,255,255,.1);
+  color:#f4f4f5;font-size:20px;font-weight:600;text-align:center;
+  outline:none;transition:border .2s;
+  -moz-appearance:textfield;
+}
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
+input[type=number]:focus{border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.2)}
+button{
+  width:100%%;height:48px;border:none;border-radius:10px;cursor:pointer;
+  background:linear-gradient(135deg,#4f46e5,#7c3aed);
+  color:#fff;font-size:15px;font-weight:600;letter-spacing:.2px;
+  transition:opacity .15s,transform .1s;margin-top:16px;
+}
+button:hover{opacity:.9}
+button:active{transform:scale(.98)}
+.captcha-error{
+  background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);
+  border-radius:8px;padding:10px 14px;text-align:center;
+  color:#f87171;font-size:13px;margin-bottom:16px;
+}
+.captcha-error.hidden{display:none}
+.footer{margin-top:24px;text-align:center;font-size:11px;color:#3f3f46}
+.footer span{color:#52525b}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="shield">🛡️</div>
+  <h1>Verificação de Segurança</h1>
+  <p class="sub">Resolva o desafio abaixo para continuar.</p>
+
+  <p id="captcha-error" class="captcha-error hidden">Resposta incorreta. Tente novamente.</p>
+
+  <div class="challenge-box">
+    <p class="question">%s</p>
+    <form method="POST" action="/%s/verify" autocomplete="off">
+      <input type="hidden" name="token" value="%s">
+      <input type="hidden" name="next"  value="%s">
+      <input type="hidden" name="mode"  value="%s">
+      <input type="number" name="answer" placeholder="?" autofocus required inputmode="numeric">
+      <button type="submit">Verificar →</button>
+    </form>
+  </div>
+
+  <p class="footer">Protegido por <span>ConvTrack Shield</span></p>
+</div>
+</body>
+</html>`, question, slug, token, moneyURL, mode)
+}
+
+// buildLoadingHTML gera a página de loading para o modo "both" (pós-CAPTCHA).
+func buildLoadingHTML(moneyURL, campaignName string) string {
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Redirecionando...</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:#09090b;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;min-height:100vh;gap:20px;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background-image:radial-gradient(ellipse at 50%% 0%%,rgba(99,102,241,.1) 0%%,transparent 60%%);
+}
+.spinner{
+  width:44px;height:44px;border-radius:50%%;
+  border:3px solid rgba(255,255,255,.06);
+  border-top-color:#6366f1;
+  animation:spin .75s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+p{color:#52525b;font-size:14px}
+</style>
+</head>
+<body>
+<div class="spinner"></div>
+<p>Redirecionando...</p>
+<script>
+setTimeout(function(){window.location.replace(%q);},800);
+</script>
+</body>
+</html>`, moneyURL)
 }
 
 // ── Campanhas ─────────────────────────────────────────────────────────────
@@ -187,6 +423,188 @@ func (h *ShieldHandler) DeleteDomain(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// ── DNS + SSL checker ────────────────────────────────────────────────────────
+
+// GET /v1/dashboard/shield/domains/:id/check
+//
+// Verifica em tempo real:
+//  1. CNAME — o domínio resolve para o hostname esperado desta API?
+//  2. SSL   — se ssl_enabled=true, o cert TLS está válido e acessível?
+//
+// Retorna JSON com o resultado de cada verificação e detalhes para debug.
+func (h *ShieldHandler) CheckDomain(c *fiber.Ctx) error {
+	p := middleware.GetProject(c)
+	if p == nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+	}
+
+	// Busca o domínio no banco
+	domains, err := h.svc.ListDomains(c.Context(), p.ID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	var domain *shield.Domain
+	for i := range domains {
+		if domains[i].ID == id {
+			domain = &domains[i]
+			break
+		}
+	}
+	if domain == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "domain not found"})
+	}
+
+	// ── 1. Verificação CNAME ──────────────────────────────────────────────────
+	// Esperamos que o CNAME do cliente aponte para o hostname desta API.
+	expectedHost := ""
+	if h.svc.APIBase != "" {
+		if u, err2 := parseHost(h.svc.APIBase); err2 == nil {
+			expectedHost = u
+		}
+	}
+
+	cnameOK := false
+	cnameTarget := ""
+	cnameMsg := ""
+
+	resolved, err := net.LookupCNAME(domain.Domain)
+	if err != nil {
+		cnameMsg = "Não foi possível resolver o CNAME: " + simplifyDNSErr(err)
+	} else {
+		// LookupCNAME retorna com ponto final (RFC) — normaliza
+		cnameTarget = strings.TrimSuffix(resolved, ".")
+		if expectedHost != "" {
+			cnameOK = strings.EqualFold(cnameTarget, expectedHost)
+			if !cnameOK {
+				cnameMsg = "CNAME aponta para " + cnameTarget + ", esperado " + expectedHost
+			}
+		} else {
+			// APIBase não configurado — só verifica se CNAME existe (não é o próprio domínio)
+			cnameOK = !strings.EqualFold(strings.TrimSuffix(cnameTarget, "."), domain.Domain)
+			if !cnameOK {
+				cnameMsg = "CNAME não configurado (resolve para o próprio domínio)"
+			}
+		}
+	}
+
+	// ── 2. Verificação SSL ────────────────────────────────────────────────────
+	sslOK := false
+	sslMsg := ""
+	sslExpiry := ""
+
+	if domain.SSLEnabled {
+		dialer := &net.Dialer{Timeout: 8 * time.Second}
+		conn, tlsErr := tls.DialWithDialer(dialer, "tcp", domain.Domain+":443", &tls.Config{
+			ServerName: domain.Domain,
+		})
+		if tlsErr != nil {
+			sslMsg = "TLS falhou: " + simplifyTLSErr(tlsErr)
+		} else {
+			state := conn.ConnectionState()
+			_ = conn.Close()
+			if len(state.PeerCertificates) > 0 {
+				cert := state.PeerCertificates[0]
+				sslExpiry = cert.NotAfter.Format("02/01/2006")
+				if time.Now().Before(cert.NotAfter) {
+					sslOK = true
+				} else {
+					sslMsg = "Certificado expirado em " + sslExpiry
+				}
+			} else {
+				sslOK = true
+			}
+		}
+	}
+
+	return c.JSON(fiber.Map{
+		"domain":       domain.Domain,
+		"cname_ok":     cnameOK,
+		"cname_target": cnameTarget,
+		"cname_msg":    cnameMsg,
+		"ssl_enabled":  domain.SSLEnabled,
+		"ssl_ok":       sslOK,
+		"ssl_msg":      sslMsg,
+		"ssl_expiry":   sslExpiry,
+		"expected_host": expectedHost,
+	})
+}
+
+// parseHost extrai o hostname de uma URL (sem porta, sem scheme).
+func parseHost(rawURL string) (string, error) {
+	if !strings.Contains(rawURL, "://") {
+		rawURL = "https://" + rawURL
+	}
+	host := rawURL
+	host = strings.TrimPrefix(host, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	if idx := strings.IndexByte(host, '/'); idx != -1 {
+		host = host[:idx]
+	}
+	if idx := strings.LastIndexByte(host, ':'); idx != -1 {
+		host = host[:idx]
+	}
+	if host == "" {
+		return "", fmt.Errorf("empty host")
+	}
+	return host, nil
+}
+
+// simplifyDNSErr reduz mensagens de erro DNS para algo legível.
+func simplifyDNSErr(err error) string {
+	s := err.Error()
+	if strings.Contains(s, "no such host") {
+		return "domínio não existe no DNS"
+	}
+	if strings.Contains(s, "timeout") {
+		return "timeout ao consultar DNS"
+	}
+	return s
+}
+
+// simplifyTLSErr reduz mensagens TLS para algo legível.
+func simplifyTLSErr(err error) string {
+	s := err.Error()
+	if strings.Contains(s, "connection refused") {
+		return "porta 443 recusada (cert ainda não emitido?)"
+	}
+	if strings.Contains(s, "timeout") {
+		return "timeout — domínio ainda não aponta para este servidor"
+	}
+	if strings.Contains(s, "certificate") {
+		return "certificado inválido"
+	}
+	return s
+}
+
+// ── Caddy On-Demand TLS — ask endpoint ──────────────────────────────────────
+
+// GET /v1/shield/domain-ask?domain=oferta.seusite.com
+//
+// Caddy chama este endpoint antes de emitir qualquer certificado TLS sob demanda.
+// Retorna 200 se o domínio está cadastrado com ssl_enabled=true, 403 caso contrário.
+// Isso impede que Caddy emita certs para domínios desconhecidos (ACME abuse prevention).
+//
+// Segurança: o endpoint não expõe informações — apenas aceita ou rejeita.
+// Em produção, o Caddy acessa via rede interna Docker (não exposto publicamente).
+func (h *ShieldHandler) DomainAsk(c *fiber.Ctx) error {
+	domain := c.Query("domain")
+	if domain == "" {
+		return c.SendStatus(fiber.StatusBadRequest)
+	}
+	// Rejeita IPs diretamente (Caddy nunca deve perguntar por IPs)
+	if net.ParseIP(domain) != nil {
+		return c.SendStatus(fiber.StatusForbidden)
+	}
+	if h.svc.IsDomainSSLEnabled(c.Context(), domain) {
+		return c.SendStatus(fiber.StatusOK)
+	}
+	return c.SendStatus(fiber.StatusForbidden)
 }
 
 // ── Webhooks ──────────────────────────────────────────────────────────────
