@@ -34,12 +34,14 @@ type Campaign struct {
 	MoneyURL      string    `json:"money_url"      db:"money_url"`       // exibida para humanos reais
 	SplitPct      int       `json:"split_pct"      db:"split_pct"`       // % de humanos → money_url
 	Enabled       bool      `json:"enabled"        db:"enabled"`
-	Platform      string    `json:"platform"       db:"platform"`        // meta|tiktok|kwai|google|taboola|manual
-	ChallengeMode string    `json:"challenge_mode" db:"challenge_mode"`  // redirect|captcha|both
-	RequireKey    bool      `json:"require_key"    db:"require_key"`     // exige ?_sk=access_key
-	AccessKey     string    `json:"access_key"     db:"access_key"`      // chave secreta gerada
-	CreatedAt     time.Time `json:"created_at"     db:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"     db:"updated_at"`
+	Platform       string    `json:"platform"        db:"platform"`        // meta|tiktok|kwai|google|taboola|manual
+	ChallengeMode  string    `json:"challenge_mode"  db:"challenge_mode"`  // redirect|captcha|both
+	RequireKey     bool      `json:"require_key"     db:"require_key"`     // exige ?_sk=access_key
+	AccessKey      string    `json:"access_key"      db:"access_key"`      // chave secreta gerada
+	UnderReview    bool      `json:"under_review"    db:"under_review"`    // modo análise: todos veem safe_url
+	RequireTtclid  bool      `json:"require_ttclid"  db:"require_ttclid"`  // exige ?ttclid= (TikTok)
+	CreatedAt      time.Time `json:"created_at"      db:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"      db:"updated_at"`
 }
 
 // Domain mapeia um hostname a uma campanha (para o proxy reverso).
@@ -67,10 +69,10 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 	_, err := s.db.Exec(ctx, `
 		INSERT INTO shield_campaigns
 		  (id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
-		   platform, challenge_mode, require_key, access_key)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		   platform, challenge_mode, require_key, access_key, under_review, require_ttclid)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		c.ID, c.ProjectID, c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
-		c.Platform, c.ChallengeMode, c.RequireKey, c.AccessKey,
+		c.Platform, c.ChallengeMode, c.RequireKey, c.AccessKey, c.UnderReview, c.RequireTtclid,
 	)
 	if err != nil {
 		return nil, err
@@ -83,7 +85,8 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Campaign, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
-		       platform, challenge_mode, require_key, access_key, created_at, updated_at
+		       platform, challenge_mode, require_key, access_key, under_review, require_ttclid,
+		       created_at, updated_at
 		FROM shield_campaigns WHERE project_id = $1 ORDER BY created_at DESC`, projectID)
 	if err != nil {
 		return nil, err
@@ -95,7 +98,8 @@ func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Cam
 		var c Campaign
 		if err := rows.Scan(&c.ID, &c.ProjectID, &c.Name, &c.Slug, &c.SafeURL, &c.MoneyURL,
 			&c.SplitPct, &c.Enabled, &c.Platform, &c.ChallengeMode,
-			&c.RequireKey, &c.AccessKey, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.RequireKey, &c.AccessKey, &c.UnderReview, &c.RequireTtclid,
+			&c.CreatedAt, &c.UpdatedAt); err != nil {
 			continue
 		}
 		list = append(list, c)
@@ -117,10 +121,12 @@ func (s *Service) UpdateCampaign(ctx context.Context, c *Campaign) error {
 	_, err := s.db.Exec(ctx, `
 		UPDATE shield_campaigns
 		SET name=$1, slug=$2, safe_url=$3, money_url=$4, split_pct=$5, enabled=$6,
-		    platform=$7, challenge_mode=$8, require_key=$9, access_key=$10, updated_at=NOW()
-		WHERE id=$11 AND project_id=$12`,
+		    platform=$7, challenge_mode=$8, require_key=$9, access_key=$10,
+		    under_review=$11, require_ttclid=$12, updated_at=NOW()
+		WHERE id=$13 AND project_id=$14`,
 		c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
-		c.Platform, c.ChallengeMode, c.RequireKey, c.AccessKey, c.ID, c.ProjectID,
+		c.Platform, c.ChallengeMode, c.RequireKey, c.AccessKey,
+		c.UnderReview, c.RequireTtclid, c.ID, c.ProjectID,
 	)
 	return err
 }
@@ -255,12 +261,14 @@ func (s *Service) ResolveCampaignBySlug(ctx context.Context, slug string) (*Camp
 	var c Campaign
 	err := s.db.QueryRow(ctx, `
 		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
-		       platform, challenge_mode, require_key, access_key, created_at, updated_at
+		       platform, challenge_mode, require_key, access_key,
+		       under_review, require_ttclid, created_at, updated_at
 		FROM shield_campaigns
 		WHERE slug = $1 AND enabled = true`, slug,
 	).Scan(&c.ID, &c.ProjectID, &c.Name, &c.Slug, &c.SafeURL, &c.MoneyURL,
 		&c.SplitPct, &c.Enabled, &c.Platform, &c.ChallengeMode,
-		&c.RequireKey, &c.AccessKey, &c.CreatedAt, &c.UpdatedAt)
+		&c.RequireKey, &c.AccessKey, &c.UnderReview, &c.RequireTtclid,
+		&c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}

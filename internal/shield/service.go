@@ -39,15 +39,17 @@ func (s *Service) GetConfig(ctx context.Context, projectID uuid.UUID) (*models.S
 		       block_vpn, block_datacenter, anti_devtools,
 		       geo_mode, geo_countries, device_filter,
 		       redirect_url, primary_url, fallback_urls, blocked_ips,
+		       block_direct, allowed_sources,
 		       updated_at::text
 		FROM shield_configs WHERE project_id = $1`, projectID)
 
-	var geoCountries, fallbackURLs, blockedIPs []string
+	var geoCountries, fallbackURLs, blockedIPs, allowedSources []string
 	err := row.Scan(
 		&cfg.ProjectID, &cfg.Enabled, &cfg.BlockBots, &cfg.BlockHeadless, &cfg.BlockSpyTools,
 		&cfg.BlockVPN, &cfg.BlockDatacenter, &cfg.AntiDevTools,
 		&cfg.GeoMode, &geoCountries, &cfg.DeviceFilter,
 		&cfg.RedirectURL, &cfg.PrimaryURL, &fallbackURLs, &blockedIPs,
+		&cfg.BlockDirect, &allowedSources,
 		&cfg.UpdatedAt,
 	)
 	if err != nil {
@@ -66,12 +68,14 @@ func (s *Service) GetConfig(ctx context.Context, projectID uuid.UUID) (*models.S
 		cfg.GeoCountries = []string{}
 		cfg.FallbackURLs = []string{}
 		cfg.BlockedIPs = []string{}
+		cfg.AllowedSources = []string{}
 		return cfg, nil
 	}
 
 	cfg.GeoCountries = geoCountries
 	cfg.FallbackURLs = fallbackURLs
 	cfg.BlockedIPs = blockedIPs
+	cfg.AllowedSources = allowedSources
 	return cfg, nil
 }
 
@@ -82,8 +86,9 @@ func (s *Service) UpsertConfig(ctx context.Context, projectID uuid.UUID, cfg *mo
 			project_id, enabled, block_bots, block_headless, block_spy_tools,
 			block_vpn, block_datacenter, anti_devtools,
 			geo_mode, geo_countries, device_filter,
-			redirect_url, primary_url, fallback_urls, blocked_ips, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
+			redirect_url, primary_url, fallback_urls, blocked_ips,
+			block_direct, allowed_sources, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
 		ON CONFLICT (project_id) DO UPDATE SET
 			enabled          = EXCLUDED.enabled,
 			block_bots       = EXCLUDED.block_bots,
@@ -99,12 +104,15 @@ func (s *Service) UpsertConfig(ctx context.Context, projectID uuid.UUID, cfg *mo
 			primary_url      = EXCLUDED.primary_url,
 			fallback_urls    = EXCLUDED.fallback_urls,
 			blocked_ips      = EXCLUDED.blocked_ips,
+			block_direct     = EXCLUDED.block_direct,
+			allowed_sources  = EXCLUDED.allowed_sources,
 			updated_at       = NOW()`,
 		projectID,
 		cfg.Enabled, cfg.BlockBots, cfg.BlockHeadless, cfg.BlockSpyTools,
 		cfg.BlockVPN, cfg.BlockDatacenter, cfg.AntiDevTools,
 		cfg.GeoMode, cfg.GeoCountries, cfg.DeviceFilter,
 		cfg.RedirectURL, cfg.PrimaryURL, cfg.FallbackURLs, cfg.BlockedIPs,
+		cfg.BlockDirect, cfg.AllowedSources,
 	)
 	return err
 }
@@ -178,6 +186,46 @@ type CheckRequest struct {
 	// Use true quando o Check é um pré-filtro rápido seguido de ProcessFingerprint
 	// (ex: SmartRedirectAdvanced), para evitar dupla contagem.
 	SkipVisit bool
+	// Fontes de tráfego
+	Referer   string // cabeçalho HTTP Referer
+	UTMSource string // parâmetro ?utm_source=
+}
+
+// detectSource identifica a plataforma de origem a partir do Referer e utm_source.
+// Retorna "meta", "tiktok", "kwai", "google" ou "direct".
+func detectSource(referer, utmSource string) string {
+	utm := strings.ToLower(utmSource)
+	ref := strings.ToLower(referer)
+
+	// UTM source tem prioridade — é o que o anunciante configura manualmente
+	switch {
+	case strings.Contains(utm, "facebook") || strings.Contains(utm, "meta") ||
+		strings.Contains(utm, "fb") || strings.Contains(utm, "instagram"):
+		return "meta"
+	case strings.Contains(utm, "tiktok") || utm == "ttk":
+		return "tiktok"
+	case strings.Contains(utm, "kwai"):
+		return "kwai"
+	case strings.Contains(utm, "google") || strings.Contains(utm, "adwords") || strings.Contains(utm, "gads"):
+		return "google"
+	}
+
+	// Fallback: Referer do navegador
+	switch {
+	case strings.Contains(ref, "facebook.com") || strings.Contains(ref, "fb.com") ||
+		strings.Contains(ref, "instagram.com") || strings.Contains(ref, "l.facebook.com"):
+		return "meta"
+	case strings.Contains(ref, "tiktok.com") || strings.Contains(ref, "vm.tiktok.com"):
+		return "tiktok"
+	case strings.Contains(ref, "kwai.com") || strings.Contains(ref, "kwai.net") ||
+		strings.Contains(ref, "kw.com"):
+		return "kwai"
+	case strings.Contains(ref, "google.com") || strings.Contains(ref, "google.") ||
+		strings.Contains(ref, "googleadservices.com") || strings.Contains(ref, "doubleclick.net"):
+		return "google"
+	}
+
+	return "direct"
 }
 
 // CheckResult é o resultado da verificação.
@@ -243,39 +291,58 @@ func (s *Service) Check(ctx context.Context, projectID uuid.UUID, req CheckReque
 	}
 
 	// ── IP intelligence (GEO + VPN + datacenter) ──────────────────────
-	if cfg.BlockVPN || cfg.BlockDatacenter || cfg.GeoMode != "disabled" {
-		ipInfo := s.lookupIP(ctx, req.IP)
+	// Sempre chamado para coletar geo data (cidade/lat/lon) para o globe.
+	// Cache Redis de 1h — custo zero em visitas repetidas do mesmo IP.
+	ipInfo := s.lookupIP(ctx, req.IP)
 
-		if cfg.BlockVPN && ipInfo.Proxy {
-			return s.block(ctx, projectID, cfg, req, "vpn"), nil
-		}
-		if cfg.BlockDatacenter && ipInfo.Hosting {
-			return s.block(ctx, projectID, cfg, req, "datacenter"), nil
-		}
+	if cfg.BlockVPN && ipInfo.Proxy {
+		return s.block(ctx, projectID, cfg, req, "vpn"), nil
+	}
+	if cfg.BlockDatacenter && ipInfo.Hosting {
+		return s.block(ctx, projectID, cfg, req, "datacenter"), nil
+	}
 
-		if cfg.GeoMode == "allowlist" && ipInfo.Country != "" {
-			allowed := false
-			for _, c := range cfg.GeoCountries {
-				if strings.EqualFold(c, ipInfo.Country) {
-					allowed = true
-					break
-				}
+	if cfg.GeoMode == "allowlist" && ipInfo.Country != "" {
+		allowed := false
+		for _, c := range cfg.GeoCountries {
+			if strings.EqualFold(c, ipInfo.Country) {
+				allowed = true
+				break
 			}
-			if !allowed {
-				req.UserAgent = ua // preserve
+		}
+		if !allowed {
+			req.UserAgent = ua // preserve
+			result := s.block(ctx, projectID, cfg, req, "geo")
+			result.Reason = fmt.Sprintf("geo:%s", ipInfo.Country)
+			return result, nil
+		}
+	}
+	if cfg.GeoMode == "blocklist" {
+		for _, c := range cfg.GeoCountries {
+			if strings.EqualFold(c, ipInfo.Country) {
 				result := s.block(ctx, projectID, cfg, req, "geo")
 				result.Reason = fmt.Sprintf("geo:%s", ipInfo.Country)
 				return result, nil
 			}
 		}
-		if cfg.GeoMode == "blocklist" {
-			for _, c := range cfg.GeoCountries {
-				if strings.EqualFold(c, ipInfo.Country) {
-					result := s.block(ctx, projectID, cfg, req, "geo")
-					result.Reason = fmt.Sprintf("geo:%s", ipInfo.Country)
-					return result, nil
-				}
+	}
+
+	// ── Fontes de tráfego ──────────────────────────────────────────────
+	// Se block_direct=true, apenas tráfego das plataformas configuradas passa.
+	// Tráfego "direto" (sem Referer/UTM reconhecido) vai para safe_url.
+	if cfg.BlockDirect && len(cfg.AllowedSources) > 0 {
+		src := detectSource(req.Referer, req.UTMSource)
+		srcAllowed := false
+		for _, allowed := range cfg.AllowedSources {
+			if strings.EqualFold(allowed, src) {
+				srcAllowed = true
+				break
 			}
+		}
+		if !srcAllowed {
+			result := s.block(ctx, projectID, cfg, req, "direct_traffic")
+			result.Reason = fmt.Sprintf("source:%s", src)
+			return result, nil
 		}
 	}
 
@@ -286,6 +353,10 @@ func (s *Service) Check(ctx context.Context, projectID uuid.UUID, req CheckReque
 		go s.insertVisit(context.Background(), projectID, VisitRecord{
 			IP:        req.IP,
 			UserAgent: req.UserAgent,
+			Country:   ipInfo.Country,
+			City:      ipInfo.City,
+			Lat:       ipInfo.Lat,
+			Lon:       ipInfo.Lon,
 			Device:    deviceFromUA(req.UserAgent),
 			IsBot:     false,
 			BotScore:  0,
@@ -358,6 +429,9 @@ type VisitRecord struct {
 	IP        string
 	UserAgent string
 	Country   string
+	City      string
+	Lat       float64
+	Lon       float64
 	Device    string
 	IsBot     bool
 	BotScore  float64
@@ -377,9 +451,9 @@ func (s *Service) insertVisit(ctx context.Context, projectID uuid.UUID, v VisitR
 	}
 	_, _ = s.db.Exec(ctx, `
 		INSERT INTO shield_visits
-		    (project_id, ip, user_agent, country, device, is_bot, bot_score, signals, action, dest_url)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		projectID, v.IP, v.UserAgent, v.Country, v.Device,
+		    (project_id, ip, user_agent, country, city, lat, lon, device, is_bot, bot_score, signals, action, dest_url)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		projectID, v.IP, v.UserAgent, v.Country, v.City, v.Lat, v.Lon, v.Device,
 		v.IsBot, v.BotScore, v.Signals, v.Action, v.DestURL,
 	)
 }
@@ -387,10 +461,13 @@ func (s *Service) insertVisit(ctx context.Context, projectID uuid.UUID, v VisitR
 // ── IP Intelligence ──────────────────────────────────────────────────────
 
 type ipAPIResult struct {
-	Status  string `json:"status"`
-	Country string `json:"countryCode"`
-	Proxy   bool   `json:"proxy"`
-	Hosting bool   `json:"hosting"`
+	Status  string  `json:"status"`
+	Country string  `json:"countryCode"`
+	City    string  `json:"city"`
+	Lat     float64 `json:"lat"`
+	Lon     float64 `json:"lon"`
+	Proxy   bool    `json:"proxy"`
+	Hosting bool    `json:"hosting"`
 }
 
 // lookupIP consulta ip-api.com com cache Redis de 1h.
@@ -414,7 +491,7 @@ func (s *Service) lookupIP(ctx context.Context, ip string) ipAPIResult {
 	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode,proxy,hosting", ip)
+	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode,city,lat,lon,proxy,hosting", ip)
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return ipAPIResult{}
@@ -494,4 +571,50 @@ func (s *Service) SmartRedirect(ctx context.Context, projectID uuid.UUID, req Ch
 	}
 	// bloqueado
 	return result.RedirectURL, true
+}
+
+// ── Geo Stats ──────────────────────────────────────────────────────────────
+
+// GeoLocation agrega visitas por cidade para exibição no globe.
+type GeoLocation struct {
+	City    string  `json:"city"`
+	Country string  `json:"country"`
+	Lat     float64 `json:"lat"`
+	Lon     float64 `json:"lon"`
+	Count   int     `json:"count"`
+}
+
+// GetGeoStats retorna as top cidades de onde visitantes acessaram (últimos 30 dias),
+// ordenadas por volume, excluindo registros sem cidade (bots/IPs locais).
+func (s *Service) GetGeoStats(ctx context.Context, projectID uuid.UUID, days int) ([]GeoLocation, error) {
+	if days <= 0 {
+		days = 30
+	}
+	rows, err := s.db.Query(ctx, `
+		SELECT city, country, AVG(lat)::float, AVG(lon)::float, COUNT(*) AS cnt
+		FROM shield_visits
+		WHERE project_id = $1
+		  AND city != ''
+		  AND created_at >= NOW() - ($2 || ' days')::INTERVAL
+		GROUP BY city, country
+		ORDER BY cnt DESC
+		LIMIT 60
+	`, projectID, days)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []GeoLocation
+	for rows.Next() {
+		var g GeoLocation
+		if err := rows.Scan(&g.City, &g.Country, &g.Lat, &g.Lon, &g.Count); err != nil {
+			continue
+		}
+		out = append(out, g)
+	}
+	if out == nil {
+		out = []GeoLocation{}
+	}
+	return out, nil
 }

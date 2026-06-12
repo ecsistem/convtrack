@@ -185,13 +185,16 @@ type ShieldConfig struct {
 	BlockVPN        bool     `json:"block_vpn"        db:"block_vpn"`
 	BlockDatacenter bool     `json:"block_datacenter" db:"block_datacenter"`
 	AntiDevTools    bool     `json:"anti_devtools"    db:"anti_devtools"`
-	GeoMode         string   `json:"geo_mode"         db:"geo_mode"`      // disabled|allowlist|blocklist
+	GeoMode         string   `json:"geo_mode"         db:"geo_mode"`         // disabled|allowlist|blocklist
 	GeoCountries    []string `json:"geo_countries"    db:"geo_countries"`
-	DeviceFilter    string   `json:"device_filter"    db:"device_filter"` // all|mobile|desktop
+	DeviceFilter    string   `json:"device_filter"    db:"device_filter"`    // all|mobile|desktop
 	RedirectURL     string   `json:"redirect_url"     db:"redirect_url"`
 	PrimaryURL      string   `json:"primary_url"      db:"primary_url"`
 	FallbackURLs    []string `json:"fallback_urls"    db:"fallback_urls"`
 	BlockedIPs      []string `json:"blocked_ips"      db:"blocked_ips"`
+	// Fontes de tráfego — bloqueia visitas que não venham das plataformas configuradas
+	BlockDirect     bool     `json:"block_direct"     db:"block_direct"`
+	AllowedSources  []string `json:"allowed_sources"  db:"allowed_sources"` // "meta"|"tiktok"|"kwai"|"google"
 	UpdatedAt       string   `json:"updated_at"       db:"updated_at"`
 }
 

@@ -35,6 +35,24 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 	ip := c.IP()
 	ua := c.Get("User-Agent")
 
+	// ── 0. Em análise — safe_url para todos sem logar como bot ─────────────
+	if campaign.UnderReview {
+		safeURL := campaign.SafeURL
+		if safeURL == "" {
+			safeURL = "https://google.com"
+		}
+		return c.Redirect(safeURL, fiber.StatusFound)
+	}
+
+	// ── 0b. TikTok Click ID obrigatório ─────────────────────────────────────
+	if campaign.RequireTtclid && c.Query("ttclid") == "" {
+		safeURL := campaign.SafeURL
+		if safeURL == "" {
+			safeURL = "https://google.com"
+		}
+		return c.Redirect(safeURL, fiber.StatusFound)
+	}
+
 	// ── 1. Chave de acesso secreta ──────────────────────────────────────────
 	if campaign.RequireKey && campaign.AccessKey != "" {
 		if c.Query("_sk") != campaign.AccessKey {
@@ -47,10 +65,12 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 		}
 	}
 
-	// ── 2. Bot check ────────────────────────────────────────────────────────
+	// ── 2. Bot check + fonte de tráfego ────────────────────────────────────
 	result, _ := h.svc.Check(c.Context(), campaign.ProjectID, shield.CheckRequest{
 		IP:        ip,
 		UserAgent: ua,
+		Referer:   c.Get("Referer"),
+		UTMSource: c.Query("utm_source"),
 	})
 
 	isBot := result != nil && !result.Allowed
@@ -772,6 +792,8 @@ func (h *ShieldHandler) SmartRedirectAdvanced(c *fiber.Ctx) error {
 		IP:        ip,
 		UserAgent: ua,
 		SkipVisit: true,
+		Referer:   c.Get("Referer"),
+		UTMSource: c.Query("utm_source"),
 	})
 
 	if result != nil && !result.Allowed {
@@ -904,4 +926,21 @@ func (h *ShieldHandler) ListVisits(c *fiber.Ctx) error {
 	).Scan(&total)
 
 	return c.JSON(fiber.Map{"data": visits, "total": total, "limit": limit, "offset": offset})
+}
+
+// GET /v1/dashboard/shield/geo?days=30
+//
+// Retorna top cidades de acesso para exibição no globe, agrupadas por (city, country)
+// com lat/lon médio e contagem de visitas.
+func (h *ShieldHandler) GeoStats(c *fiber.Ctx) error {
+	p := middleware.GetProject(c)
+	if p == nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	days, _ := strconv.Atoi(c.Query("days", "30"))
+	locations, err := h.svc.GetGeoStats(c.Context(), p.ID, days)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"data": locations})
 }

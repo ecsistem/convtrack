@@ -214,6 +214,8 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	dash.Post("/shield/webhooks/:id/test",      shieldH.TestWebhook)
 	// Visitas com fingerprint
 	dash.Get("/shield/visits",             shieldH.ListVisits)
+	// Geo stats para o globe
+	dash.Get("/shield/geo",                shieldH.GeoStats)
 	// Camuflagem adversarial de imagem
 	dash.Post("/shield/imgcamo",           shieldH.CamouflageImage)
 	// Camuflagem adversarial de vídeo (frame a frame via ffmpeg)
