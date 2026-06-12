@@ -317,3 +317,31 @@ func (s *Service) OnlineCount(ctx context.Context, projectID uuid.UUID) (int, er
 	).Scan(&count)
 	return count, err
 }
+
+// ListSessionEvents retorna todos os eventos de uma sessão específica (para sidebar do replay).
+func (s *Service) ListSessionEvents(ctx context.Context, projectID, sessionID uuid.UUID) ([]models.Event, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT id, session_id, project_id, name, COALESCE(properties, '{}'::jsonb), created_at
+		FROM events
+		WHERE project_id = $1 AND session_id = $2
+		ORDER BY created_at ASC`,
+		projectID, sessionID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []models.Event
+	for rows.Next() {
+		var ev models.Event
+		if err := rows.Scan(&ev.ID, &ev.SessionID, &ev.ProjectID, &ev.Name, &ev.Properties, &ev.CreatedAt); err != nil {
+			continue
+		}
+		events = append(events, ev)
+	}
+	if events == nil {
+		events = []models.Event{}
+	}
+	return events, nil
+}

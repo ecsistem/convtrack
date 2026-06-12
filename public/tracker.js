@@ -849,56 +849,75 @@ rrweb/dist/rrweb.js:
   });
 
   // ── Session Replay (rrweb) ────────────────────────────────────────────────
+  // Grava em TODAS as páginas quando data-replay != 'false'.
+  // Trigger keywords são usados apenas como label do evento, não como filtro de gravação.
 
-  if (replayOn) {
+  if (replayOn && typeof rrweb !== 'undefined') {
     var replayTriggers = (script.getAttribute('data-replay-triggers') || 'checkout,order,obrigado,thank,lead').split(',');
-    var currentPath = window.location.pathname.toLowerCase();
-    var shouldRecord = replayTriggers.some(function (t) { return currentPath.indexOf(t.trim()) !== -1; });
-    var replayTrigger = '';
+    var currentPath    = window.location.pathname.toLowerCase();
+    var replayTrigger  = '';
     replayTriggers.forEach(function (t) { if (currentPath.indexOf(t.trim()) !== -1) replayTrigger = t.trim(); });
 
-    if (shouldRecord && typeof rrweb !== 'undefined') {
-      var replayBatch = [];
-      var flushTimer;
-      var BATCH_SIZE  = 50;
-      var FLUSH_MS    = 5000;
+    var replayBatch  = [];
+    var batchTimer   = null;
+    var s3Timer      = null;
+    var BATCH_SIZE   = 50;    // eventos por envio ao Redis
+    var BATCH_MS     = 5000;  // intervalo de envio ao Redis (5s)
+    var S3_FLUSH_MS  = 60000; // flush periódico pro S3 (60s)
 
-      function sendBatch(final) {
-        if (replayBatch.length === 0 && !final) return;
-        var toSend = replayBatch.splice(0);
-        if (final) {
-          if (toSend.length > 0) send('/v1/replay/events', { session_id: sessionId, trigger: replayTrigger, events: toSend });
-          var flushBody = JSON.stringify({ api_key: apiKey, session_id: sessionId, trigger: replayTrigger });
-          if (navigator.sendBeacon) {
-            navigator.sendBeacon(apiBase + '/v1/replay/flush', new Blob([flushBody], { type: 'application/json' }));
-          } else {
-            send('/v1/replay/flush', { session_id: sessionId, trigger: replayTrigger });
-          }
-        } else {
-          send('/v1/replay/events', { session_id: sessionId, trigger: replayTrigger, events: toSend });
-        }
-      }
-
-      function scheduledFlush() {
-        sendBatch(false);
-        clearTimeout(flushTimer);
-        flushTimer = setTimeout(scheduledFlush, FLUSH_MS);
-      }
-
-      rrweb.record({
-        emit: function (event) {
-          replayBatch.push(event);
-          if (replayBatch.length >= BATCH_SIZE) { sendBatch(false); clearTimeout(flushTimer); flushTimer = setTimeout(scheduledFlush, FLUSH_MS); }
-        },
-        sampling: { mousemove: 50, scroll: 150, input: 'last' },
-        maskInputOptions: { password: true, email: false, number: false },
-        blockClass: 'ct-block',
-      });
-
-      flushTimer = setTimeout(scheduledFlush, FLUSH_MS);
-      window.addEventListener('beforeunload', function () { sendBatch(true); });
-      window._ctFlushReplay = function () { sendBatch(true); };
+    // Envia o batch atual pro Redis (buffer intermediário)
+    function pushToRedis() {
+      if (replayBatch.length === 0) return;
+      var toSend = replayBatch.splice(0);
+      send('/v1/replay/events', { session_id: sessionId, trigger: replayTrigger, events: toSend });
     }
+
+    // Flush completo: envia eventos pendentes + persiste Redis → S3
+    function flushToS3(sync) {
+      pushToRedis();
+      var flushBody = JSON.stringify({ api_key: apiKey, session_id: sessionId, trigger: replayTrigger });
+      if (sync && navigator.sendBeacon) {
+        // beforeunload: usa sendBeacon (mais confiável que fetch durante unload)
+        navigator.sendBeacon(apiBase + '/v1/replay/flush', new Blob([flushBody], { type: 'application/json' }));
+      } else {
+        send('/v1/replay/flush', { session_id: sessionId, trigger: replayTrigger });
+      }
+    }
+
+    // Tick periódico de envio pro Redis
+    function scheduleBatch() {
+      clearTimeout(batchTimer);
+      batchTimer = setTimeout(function () { pushToRedis(); scheduleBatch(); }, BATCH_MS);
+    }
+
+    // Tick periódico de flush pro S3 — garante que a sessão seja salva mesmo sem beforeunload
+    function scheduleS3Flush() {
+      clearTimeout(s3Timer);
+      s3Timer = setTimeout(function () { flushToS3(false); scheduleS3Flush(); }, S3_FLUSH_MS);
+    }
+
+    rrweb.record({
+      emit: function (event) {
+        replayBatch.push(event);
+        // Força envio imediato ao atingir BATCH_SIZE para não acumular em memória
+        if (replayBatch.length >= BATCH_SIZE) {
+          pushToRedis();
+          clearTimeout(batchTimer);
+          scheduleBatch();
+        }
+      },
+      sampling:         { mousemove: 50, scroll: 150, input: 'last' },
+      maskInputOptions: { password: true, email: false, number: false },
+      blockClass:       'ct-block',
+    });
+
+    scheduleBatch();
+    scheduleS3Flush();
+
+    // Flush final ao sair da página
+    window.addEventListener('beforeunload', function () { flushToS3(true); });
+    // API pública para flush manual (ex: após conversão)
+    window._ctFlushReplay = function () { flushToS3(false); };
   }
 
   // ── Trigger Rules Engine ──────────────────────────────────────────────────

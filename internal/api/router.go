@@ -145,6 +145,7 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	dash.Get("/events",               analyticsH.GetEvents)
 	dash.Get("/conversions",          dashboardH.Conversions)
 	dash.Get("/sessions",             dashboardH.Sessions)
+	dash.Get("/sessions/:id/events",  dashboardH.SessionEvents)
 	dash.Get("/settings",             analyticsH.GetSettings)
 	dash.Put("/settings",             analyticsH.PutSettings)
 	dash.Get("/ad-costs",             analyticsH.ListAdCosts)

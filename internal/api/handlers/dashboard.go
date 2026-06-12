@@ -7,6 +7,7 @@ import (
 	"github.com/ecsistem/convtrack/internal/conversion"
 	"github.com/ecsistem/convtrack/internal/session"
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 )
 
 type DashboardHandler struct {
@@ -96,4 +97,25 @@ func (h *DashboardHandler) Sessions(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"data": list, "limit": limit, "offset": offset})
+}
+
+// GET /v1/dashboard/sessions/:id/events
+// Retorna todos os eventos rastreados para uma sessão específica (sidebar do replay player).
+func (h *DashboardHandler) SessionEvents(c *fiber.Ctx) error {
+	project := middleware.GetProject(c)
+	if project == nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+
+	sessionID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid session id"})
+	}
+
+	events, err := h.sessions.ListSessionEvents(c.Context(), project.ID, sessionID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(fiber.Map{"data": events})
 }

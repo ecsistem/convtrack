@@ -17,8 +17,6 @@ const (
 	redisPrefix = "replay:buf:"
 	// TTL do buffer: se não chegar nada em 30 min, expira e perde (sessão abandonada)
 	bufferTTL = 30 * time.Minute
-	// Flush automático quando atingir este número de eventos no buffer
-	autoFlushThreshold = 300
 )
 
 type Service struct {
@@ -32,7 +30,7 @@ func New(db *pgxpool.Pool, rdb *redis.Client, s3 *storage.S3Client) *Service {
 }
 
 // AppendEvents adiciona eventos rrweb ao buffer Redis da sessão.
-// Se o buffer atingir autoFlushThreshold, faz flush imediato pro S3.
+// O flush pro S3 é controlado pelo frontend (timer periódico de 60s + beforeunload).
 func (s *Service) AppendEvents(ctx context.Context, projectID, sessionID uuid.UUID, events []json.RawMessage, triggerEvent string) error {
 	key := redisPrefix + sessionID.String()
 
@@ -45,28 +43,25 @@ func (s *Service) AppendEvents(ctx context.Context, projectID, sessionID uuid.UU
 		return fmt.Errorf("replay: redis append: %w", err)
 	}
 
-	// Verifica tamanho do buffer
-	count, err := s.redis.LLen(ctx, key).Result()
-	if err != nil {
-		return nil // não crítico
-	}
-
-	if count >= autoFlushThreshold {
-		return s.FlushToS3(ctx, projectID, sessionID, triggerEvent)
-	}
 	return nil
 }
 
-// FlushToS3 lê todos os eventos do buffer Redis, comprime e sobe pro S3.
-// Registra a referência na tabela `replays`.
+// FlushToS3 lê todos os eventos acumulados do buffer Redis, comprime e sobe pro S3.
+// NÃO apaga o buffer — cada flush regrava o replay completo (todos os eventos da sessão).
+// O Redis expira naturalmente pelo TTL (30 min de inatividade).
+// Isso garante que o replay no S3 sempre contenha a gravação inteira,
+// mesmo com múltiplos flushes periódicos durante a mesma sessão.
 func (s *Service) FlushToS3(ctx context.Context, projectID, sessionID uuid.UUID, triggerEvent string) error {
 	key := redisPrefix + sessionID.String()
 
-	// Lê todos os eventos do buffer de uma vez
+	// Lê TODOS os eventos acumulados (desde o início da sessão)
 	raw, err := s.redis.LRange(ctx, key, 0, -1).Result()
 	if err != nil || len(raw) == 0 {
 		return nil
 	}
+
+	// Renova o TTL para não expirar durante sessão ativa
+	_ = s.redis.Expire(ctx, key, bufferTTL)
 
 	// Monta array JSON: [ event1, event2, ... ]
 	payload, err := buildJSONArray(raw)
@@ -81,14 +76,10 @@ func (s *Service) FlushToS3(ctx context.Context, projectID, sessionID uuid.UUID,
 		return fmt.Errorf("replay: s3 upload: %w", err)
 	}
 
-	// Salva referência no banco
+	// Salva/atualiza referência no banco (ON CONFLICT atualiza o registro existente)
 	if err := s.upsertReplayRecord(ctx, sessionID, projectID, s3Key, len(raw), triggerEvent); err != nil {
-		// Não falha — o arquivo já foi pro S3
 		fmt.Printf("replay: save record error: %v\n", err)
 	}
-
-	// Limpa o buffer do Redis
-	_ = s.redis.Del(ctx, key)
 
 	return nil
 }
