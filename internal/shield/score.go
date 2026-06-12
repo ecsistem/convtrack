@@ -8,6 +8,7 @@ var botSignalWeights = map[string]float64{
 	"headless":           0.90, // UA HeadlessChrome/Puppeteer/Playwright/Selenium
 	"bot":                0.85, // UA de crawler/bot conhecido
 	"spy_tool":           0.80, // UA de AdSpy, BigSpy, Minea, etc.
+	"reviewer_range":     0.92, // IP em faixa de revisor/crawler de plataforma (Meta/Google)
 	"ip_blocked":         0.99, // IP na lista de bloqueio manual
 
 	// Rede

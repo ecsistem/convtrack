@@ -272,6 +272,12 @@ func (s *Service) Check(ctx context.Context, projectID uuid.UUID, req CheckReque
 		return s.block(ctx, projectID, cfg, req, "headless"), nil
 	}
 
+	// ── Faixas de revisor/crawler de plataforma (Meta/Google) ───────────
+	// Rede de segurança estática: funciona mesmo se o ip-api falhar/throttlar.
+	if cfg.BlockBots && isReviewerIP(req.IP) {
+		return s.block(ctx, projectID, cfg, req, "reviewer_range"), nil
+	}
+
 	// ── IP blocklist ────────────────────────────────────────────────────
 	for _, blocked := range cfg.BlockedIPs {
 		if blocked != "" && req.IP == blocked {
@@ -295,10 +301,12 @@ func (s *Service) Check(ctx context.Context, projectID uuid.UUID, req CheckReque
 	// Cache Redis de 1h — custo zero em visitas repetidas do mesmo IP.
 	ipInfo := s.lookupIP(ctx, req.IP)
 
-	if cfg.BlockVPN && ipInfo.Proxy {
+	// VPN/datacenter: combina o sinal do ip-api com faixas/ASNs estáticos.
+	// As listas estáticas funcionam mesmo se o ip-api falhar/throttlar.
+	if cfg.BlockVPN && (ipInfo.Proxy || isVPNIP(req.IP) || isVPNASN(ipInfo.As)) {
 		return s.block(ctx, projectID, cfg, req, "vpn"), nil
 	}
-	if cfg.BlockDatacenter && ipInfo.Hosting {
+	if cfg.BlockDatacenter && (ipInfo.Hosting || isDatacenterIP(req.IP) || isDatacenterASN(ipInfo.As)) {
 		return s.block(ctx, projectID, cfg, req, "datacenter"), nil
 	}
 
@@ -468,6 +476,7 @@ type ipAPIResult struct {
 	Lon     float64 `json:"lon"`
 	Proxy   bool    `json:"proxy"`
 	Hosting bool    `json:"hosting"`
+	As      string  `json:"as"` // "AS15169 Google LLC"
 }
 
 // lookupIP consulta ip-api.com com cache Redis de 1h.
@@ -491,7 +500,7 @@ func (s *Service) lookupIP(ctx context.Context, ip string) ipAPIResult {
 	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode,city,lat,lon,proxy,hosting", ip)
+	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode,city,lat,lon,proxy,hosting,as", ip)
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return ipAPIResult{}

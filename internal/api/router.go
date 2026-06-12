@@ -197,12 +197,13 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	app.Get("/v1/shield/domain-ask", shieldH.DomainAsk)
 
 	// Smart redirect avançado (fingerprinting + A/B, server-side)
-	app.Get("/r/:projectKey", apiKeyAuth, shieldH.SmartRedirectAdvanced)
+	cloakRL := middleware.CloakRateLimit()
+	app.Get("/r/:projectKey", cloakRL, apiKeyAuth, shieldH.SmartRedirectAdvanced)
 
 	// Slug cloaker — /:slug (sem autenticação, público)
 	// Deve ficar antes do catch-all de domínio mas após rotas fixas
-	app.Get("/:slug", shieldH.SlugCloak)
-	app.Post("/:slug/verify", shieldH.VerifyCaptcha) // CAPTCHA verification
+	app.Get("/:slug", cloakRL, shieldH.SlugCloak)
+	app.Post("/:slug/verify", cloakRL, shieldH.VerifyCaptcha) // CAPTCHA verification
 
 	// ── Shield dashboard (JWT) ─────────────────────────────────────────────────
 	dash.Get("/shield/config",             shieldH.GetConfig)

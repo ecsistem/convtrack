@@ -153,7 +153,7 @@ func (h *ShieldHandler) Check(c *fiber.Ctx) error {
 	_ = c.BodyParser(&body)
 
 	ua := c.Get("User-Agent")
-	ip := c.IP()
+	ip := middleware.ClientIP(c)
 
 	result, err := h.svc.Check(c.Context(), project.ID, shield.CheckRequest{
 		IP:           ip,
@@ -189,7 +189,7 @@ func (h *ShieldHandler) SmartRedirect(c *fiber.Ctx) error {
 	}
 
 	ua := c.Get("User-Agent")
-	ip := c.IP()
+	ip := middleware.ClientIP(c)
 
 	dest, blocked := h.svc.SmartRedirect(c.Context(), project.ID, shield.CheckRequest{
 		IP:        ip,

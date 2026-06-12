@@ -32,7 +32,7 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 		return c.Next() // slug não existe — deixa passar para outras rotas
 	}
 
-	ip := c.IP()
+	ip := middleware.ClientIP(c)
 	ua := c.Get("User-Agent")
 
 	// ── 0. Em análise — safe_url para todos sem logar como bot ─────────────
@@ -44,13 +44,23 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 		return c.Redirect(safeURL, fiber.StatusFound)
 	}
 
-	// ── 0b. TikTok Click ID obrigatório ─────────────────────────────────────
+	// ── 0b. Click ID obrigatório (revisor de anúncio abre sem o click pago) ──
+	// require_ttclid (legado, TikTok) OU require_clickid (genérico por plataforma).
 	if campaign.RequireTtclid && c.Query("ttclid") == "" {
 		safeURL := campaign.SafeURL
 		if safeURL == "" {
 			safeURL = "https://google.com"
 		}
 		return c.Redirect(safeURL, fiber.StatusFound)
+	}
+	if campaign.RequireClickID {
+		if param := shield.ClickIDParam(campaign.Platform); param != "" && c.Query(param) == "" {
+			safeURL := campaign.SafeURL
+			if safeURL == "" {
+				safeURL = "https://google.com"
+			}
+			return c.Redirect(safeURL, fiber.StatusFound)
+		}
 	}
 
 	// ── 1. Chave de acesso secreta ──────────────────────────────────────────
@@ -739,7 +749,7 @@ func (h *ShieldHandler) Fingerprint(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
 	}
 
-	ip := c.IP()
+	ip := middleware.ClientIP(c)
 	ua := c.Get("User-Agent")
 
 	result, err := h.svc.ProcessFingerprint(c.Context(), p.ID, ip, ua, &fp)
@@ -783,7 +793,7 @@ func (h *ShieldHandler) SmartRedirectAdvanced(c *fiber.Ctx) error {
 	}
 
 	ua := c.Get("User-Agent")
-	ip := c.IP()
+	ip := middleware.ClientIP(c)
 
 	// Verificação rápida server-side para bots óbvios.
 	// SkipVisit=true porque humanos passam para ProcessFingerprint (que registra a visita completa).

@@ -28,7 +28,38 @@
 
   // ── Detecções imediatas (síncronas) ───────────────────────────────────
   var webdriver    = !!navigator.webdriver;
-  var headlessHint = /HeadlessChrome|PhantomJS|Puppeteer|Playwright|Selenium/i.test(navigator.userAgent);
+
+  // Propriedades injetadas por frameworks de automação (Selenium/Puppeteer/
+  // Playwright/PhantomJS/Nightmare). A presença de qualquer uma denuncia o bot.
+  function hasAutomationProps() {
+    var winProps = [
+      '_phantom', '__nightmare', '_selenium', 'callPhantom',
+      '_Selenium_IDE_Recorder', 'calledSelenium', '$chrome_asyncScriptInfo',
+      '__$webdriverAsyncExecutor', 'domAutomation', 'domAutomationController'
+    ];
+    for (var i = 0; i < winProps.length; i++) {
+      try { if (window[winProps[i]]) return true; } catch (e) {}
+    }
+    var docKeys = [
+      '__webdriver_evaluate', '__selenium_evaluate', '__webdriver_script_function',
+      '__webdriver_script_func', '__webdriver_script_fn', '__fxdriver_evaluate',
+      '__driver_unwrapped', '__webdriver_unwrapped', '__driver_evaluate',
+      '__selenium_unwrapped', '__fxdriver_unwrapped'
+    ];
+    for (var j = 0; j < docKeys.length; j++) {
+      try { if (document[docKeys[j]]) return true; } catch (e) {}
+    }
+    // ChromeDriver injeta uma chave $cdc_... no document
+    try {
+      for (var k in document) {
+        if (k.indexOf('$cdc_') === 0 || k.indexOf('cdc_adoQpoasnfa76pfcZLmcfl_') === 0) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  var headlessHint = /HeadlessChrome|PhantomJS|Puppeteer|Playwright|Selenium|SlimerJS|CasperJS|Nightmare|Splash|Cypress|TestCafe/i.test(navigator.userAgent)
+                   || hasAutomationProps();
   var sessionHash  = (Math.random().toString(36) + Date.now().toString(36)).slice(2, 18);
 
   // ── Coleta assíncrona de sinais ───────────────────────────────────────

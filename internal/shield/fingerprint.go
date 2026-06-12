@@ -93,6 +93,11 @@ func (s *Service) ProcessFingerprint(ctx context.Context, projectID uuid.UUID, i
 		// "Brian Paul" é o fallback de software renderer (Mesa/SwiftShader — indica headless)
 		signals = append(signals, "no_webgl")
 	}
+	// Renderer de software (SwiftShader/llvmpipe/Mesa/ANGLE software) → headless.
+	// GPUs reais retornam nomes de hardware (Apple/Adreno/Mali/NVIDIA/Intel/AMD).
+	if isSoftwareRenderer(fp.WebGLRenderer) {
+		signals = append(signals, "headless")
+	}
 	if fp.AudioHash == "" || fp.AudioHash == "none" || fp.AudioHash == "error" {
 		signals = append(signals, "no_audio")
 	}
@@ -137,15 +142,20 @@ func (s *Service) ProcessFingerprint(ctx context.Context, projectID uuid.UUID, i
 		}
 	}
 
+	// ── Faixas estáticas de revisor/datacenter/VPN (não dependem do ip-api) ──
+	if cfg.BlockBots && isReviewerIP(ip) {
+		signals = append(signals, "reviewer_range")
+	}
+
 	// ── IP intelligence (async; usa cache Redis) ──────────────────────
 	var country string
 	if cfg.BlockVPN || cfg.BlockDatacenter || cfg.GeoMode != "disabled" {
 		ipInfo := s.lookupIP(ctx, ip)
 		country = ipInfo.Country // captura país para shield_visits
-		if cfg.BlockVPN && ipInfo.Proxy {
+		if cfg.BlockVPN && (ipInfo.Proxy || isVPNIP(ip) || isVPNASN(ipInfo.As)) {
 			signals = append(signals, "vpn")
 		}
-		if cfg.BlockDatacenter && ipInfo.Hosting {
+		if cfg.BlockDatacenter && (ipInfo.Hosting || isDatacenterIP(ip) || isDatacenterASN(ipInfo.As)) {
 			signals = append(signals, "datacenter")
 		}
 		if cfg.GeoMode == "allowlist" && ipInfo.Country != "" {

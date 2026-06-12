@@ -27,6 +27,27 @@ var botPatterns = []string{
 	// Security scanners
 	"nikto", "nmap", "masscan", "zgrab", "nuclei",
 	"sqlmap", "nessus", "openvas", "burpsuite", "w3af",
+	"wpscan", "dirbuster", "gobuster", "feroxbuster", "burp",
+	"owasp", "acunetix", "qualys", "skipfish",
+	// Crawlers de serviço do Google (revisores / verificadores)
+	"mediapartners-google", "adsbot-google", "googlebot-image",
+	"googlebot-news", "googlebot-video", "apis-google",
+	"google-site-verification", "googleproducer",
+	"chrome-lighthouse", "lighthouse", "pagespeed",
+	// SEO / análise adicionais
+	"blexbot", "linkdexbot", "screaming frog", "dataforseobot", "ccbot",
+	// Preview de links / social adicionais
+	"embedly", "quora link preview", "redditbot",
+	// Bibliotecas HTTP / clientes de API
+	"aiohttp", "httpx", "undici", "postmanruntime", "insomnia",
+	"httpie", "guzzlehttp", "superagent", "got (",
+	"ruby", "php/", "perl",
+	// Monitoramento / performance
+	"cloudflare-alwaysonline", "uptimerobot", "pingdom", "statuscake",
+	"gtmetrix", "webpagetest", "ptst", "ylt",
+	// NOTA: "tiktok" e "bytedance" NÃO entram aqui de propósito — o
+	// navegador in-app do TikTok contém esses tokens no UA e são tráfego
+	// pago real. Apenas "bytespider" (crawler) é bloqueado.
 }
 
 // spyToolPatterns — ferramentas de espionagem de criativos/anúncios
@@ -45,6 +66,7 @@ var headlessPatterns = []string{
 	"headlesschrome", "headless", "phantomjs", "nightmare",
 	"puppeteer", "playwright", "selenium", "webdriver",
 	"htmlunit", "triton", "slimerjs", "casperjs",
+	"splash", "cypress", "testcafe",
 }
 
 // isBot verifica se o UA contém padrão de bot
@@ -62,6 +84,27 @@ func isBot(ua string) bool {
 func isSpyTool(ua string) bool {
 	lower := strings.ToLower(ua)
 	for _, p := range spyToolPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// softwareRenderers — nomes de GPU de software (rasterizadores), indicativos
+// de browser headless/automação (sem GPU real).
+var softwareRenderers = []string{
+	"swiftshader", "llvmpipe", "mesa offscreen", "software rasterizer",
+	"google swiftshader", "microsoft basic render", "virtualbox", "vmware",
+}
+
+// isSoftwareRenderer verifica se o renderer WebGL é um rasterizador de software.
+func isSoftwareRenderer(renderer string) bool {
+	lower := strings.ToLower(renderer)
+	if lower == "" {
+		return false
+	}
+	for _, p := range softwareRenderers {
 		if strings.Contains(lower, p) {
 			return true
 		}
