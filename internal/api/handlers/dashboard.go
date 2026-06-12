@@ -1,6 +1,9 @@
 package handlers
 
 import (
+	"encoding/base64"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ecsistem/convtrack/internal/api/middleware"
@@ -86,17 +89,71 @@ func (h *DashboardHandler) Sessions(c *fiber.Ctx) error {
 	}
 
 	limit := c.QueryInt("limit", 50)
-	offset := c.QueryInt("offset", 0)
 	if limit > 200 {
 		limit = 200
 	}
+	if limit < 1 {
+		limit = 50
+	}
 
-	list, err := h.sessions.ListSessions(c.Context(), project.ID, limit, offset)
+	// Modo legado por offset (mantido p/ compatibilidade): só usado se ?offset estiver presente.
+	if c.Query("cursor") == "" && c.Query("offset") != "" {
+		offset := c.QueryInt("offset", 0)
+		list, err := h.sessions.ListSessions(c.Context(), project.ID, limit, offset)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(fiber.Map{"data": list, "limit": limit, "offset": offset})
+	}
+
+	// Paginação por cursor (keyset) — estável sob inserções em tempo real.
+	beforeTime, beforeID, err := decodeCursor(c.Query("cursor"))
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cursor inválido"})
+	}
+
+	list, err := h.sessions.ListSessionsCursor(c.Context(), project.ID, beforeTime, beforeID, limit)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	return c.JSON(fiber.Map{"data": list, "limit": limit, "offset": offset})
+	var nextCursor string
+	if len(list) == limit {
+		last := list[len(list)-1]
+		nextCursor = encodeCursor(last.StartedAt, last.ID)
+	}
+
+	return c.JSON(fiber.Map{"data": list, "limit": limit, "next_cursor": nextCursor})
+}
+
+// encodeCursor serializa (started_at, id) em um token opaco base64.
+func encodeCursor(t time.Time, id uuid.UUID) string {
+	raw := t.UTC().Format(time.RFC3339Nano) + "|" + id.String()
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// decodeCursor faz o parse de um token de cursor. Token vazio = primeira página.
+func decodeCursor(cursor string) (*time.Time, uuid.UUID, error) {
+	if cursor == "" {
+		return nil, uuid.Nil, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return nil, uuid.Nil, err
+	}
+	parts := strings.SplitN(string(raw), "|", 2)
+	if len(parts) != 2 {
+		return nil, uuid.Nil, fmt.Errorf("formato inválido")
+	}
+	t, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return nil, uuid.Nil, err
+	}
+	id, err := uuid.Parse(parts[1])
+	if err != nil {
+		return nil, uuid.Nil, err
+	}
+	return &t, id, nil
 }
 
 // GET /v1/dashboard/sessions/:id/events

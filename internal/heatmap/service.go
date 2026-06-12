@@ -105,7 +105,7 @@ type URLStat struct {
 func (s *Service) Aggregate(ctx context.Context, projectID uuid.UUID, urlPath string, since time.Time) ([]Point, []ElementStat, int, error) {
 	// Pontos: arredonda posição relativa a uma grade de ~0.5% para reduzir cardinalidade.
 	pointRows, err := s.db.Query(ctx, `
-		SELECT ROUND(xp::numeric, 3) AS gx, ROUND(yp::numeric, 3) AS gy, COUNT(*)
+		SELECT ROUND(xp::numeric, 3)::float8 AS gx, ROUND(yp::numeric, 3)::float8 AS gy, COUNT(*)
 		FROM heatmap_clicks
 		WHERE project_id = $1 AND url_path = $2 AND created_at >= $3
 		GROUP BY gx, gy

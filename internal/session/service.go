@@ -7,6 +7,7 @@ import (
 
 	"github.com/ecsistem/convtrack/internal/models"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -265,7 +266,55 @@ func (s *Service) ListSessions(ctx context.Context, projectID uuid.UUID, limit, 
 		return nil, err
 	}
 	defer rows.Close()
+	return scanSessions(rows)
+}
 
+// sessionSelectCols é o SELECT compartilhado por ListSessions e ListSessionsCursor.
+const sessionSelectCols = `
+	SELECT
+		s.id, s.visitor_id, s.project_id, s.started_at, s.last_activity,
+		s.landing_page, s.referrer, s.user_agent, s.ip,
+		COALESCE(s.country,''), COALESCE(s.city,''),
+		COALESCE(s.device,''), COALESCE(s.browser,''), COALESCE(s.os,''),
+		COALESCE(s.screen_width,0), COALESCE(s.screen_height,0),
+		COALESCE(s.timezone,''), COALESCE(s.language,''),
+		COALESCE(s.duration_seconds,0), COALESCE(s.page_count,1), COALESCE(s.exit_page,''),
+		COALESCE(s.click_count,0), COALESCE(s.input_count,0),
+		COALESCE(s.scroll_depth_pct,0), COALESCE(s.rage_clicks,0),
+		(SELECT EXTRACT(EPOCH FROM MIN(c.created_at) - s.started_at)::INT
+		 FROM conversions c
+		 WHERE c.session_id = s.id AND c.status = 'approved') AS time_to_purchase,
+		COALESCE(a.utm_source,''), COALESCE(a.utm_medium,''), COALESCE(a.utm_campaign,''),
+		(SELECT COUNT(*) FROM events e WHERE e.session_id = s.id) AS event_count,
+		EXISTS(SELECT 1 FROM replays r WHERE r.session_id = s.id) AS has_replay
+	FROM sessions s
+	LEFT JOIN attributions a ON a.session_id = s.id
+	WHERE s.project_id = $1`
+
+// ListSessionsCursor faz paginação keyset (cursor) estável sob inserções em
+// tempo real. O cursor é a tupla (started_at, id) da última linha da página
+// anterior; quando beforeTime é nil, retorna a primeira página (mais recentes).
+func (s *Service) ListSessionsCursor(ctx context.Context, projectID uuid.UUID, beforeTime *time.Time, beforeID uuid.UUID, limit int) ([]models.Session, error) {
+	var rows pgx.Rows
+	var err error
+	if beforeTime == nil {
+		rows, err = s.db.Query(ctx, sessionSelectCols+`
+			ORDER BY s.started_at DESC, s.id DESC
+			LIMIT $2`, projectID, limit)
+	} else {
+		rows, err = s.db.Query(ctx, sessionSelectCols+`
+			AND (s.started_at, s.id) < ($2, $3)
+			ORDER BY s.started_at DESC, s.id DESC
+			LIMIT $4`, projectID, *beforeTime, beforeID, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSessions(rows)
+}
+
+func scanSessions(rows pgx.Rows) ([]models.Session, error) {
 	var sessions []models.Session
 	for rows.Next() {
 		var sess models.Session
