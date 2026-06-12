@@ -29,6 +29,9 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 	if body.Name == "" || body.Email == "" || len(body.Password) < 6 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "name, email e senha (mín 6 chars) obrigatórios"})
 	}
+	if !validEmail(body.Email) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "email inválido"})
+	}
 
 	result, err := h.svc.Register(c.Context(), body.Name, body.Email, body.Password)
 	if errors.Is(err, auth.ErrEmailTaken) {

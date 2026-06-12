@@ -12,6 +12,7 @@ import (
 	"github.com/ecsistem/convtrack/internal/auth"
 	"github.com/ecsistem/convtrack/internal/cache"
 	"github.com/ecsistem/convtrack/internal/conversion"
+	"github.com/ecsistem/convtrack/internal/heatmap"
 	"github.com/ecsistem/convtrack/internal/queue"
 	"github.com/ecsistem/convtrack/internal/replay"
 	"github.com/ecsistem/convtrack/internal/rules"
@@ -43,9 +44,10 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	sessionSvc  := session.New(db)
 	attrSvc     := attribution.New(sessionSvc)
 	q           := queue.New(rawRedis)
-	convSvc     := conversion.NewWithQueue(db, attrSvc, q)
+	convSvc     := conversion.NewWithQueue(db, attrSvc, q).WithLive(rawRedis)
 	authSvc     := auth.New(db)
 	analyticsSvc := analytics.New(db)
+	heatmapSvc  := heatmap.New(db)
 
 	// S3 for session replay (optional)
 	var replayH *handlers.ReplayHandler
@@ -61,7 +63,7 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	shieldSvc := shield.New(db, rawRedis)
 
 	// ── Handlers ──────────────────────────────────────────────────────────────
-	collectH      := handlers.NewCollect(sessionSvc, attrSvc)
+	collectH      := handlers.NewCollect(sessionSvc, attrSvc).WithLive(rawRedis)
 	webhookH      := handlers.NewWebhook(convSvc, attrSvc)
 	dashboardH    := handlers.NewDashboard(convSvc, sessionSvc)
 	rulesSvc      := rules.New(db)
@@ -71,6 +73,8 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	projectsH     := handlers.NewProjects(authSvc)
 	integrationsH := handlers.NewIntegrations(db)
 	shieldH       := handlers.NewShield(shieldSvc, rawRedis)
+	heatmapH      := handlers.NewHeatmap(heatmapSvc)
+	liveH         := handlers.NewLive(rawRedis)
 
 	// ── Middleware factories ───────────────────────────────────────────────────
 	apiKeyAuth    := middleware.APIKey(db, rdb)
@@ -80,19 +84,24 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 
 	// ── Public auth endpoints ─────────────────────────────────────────────────
 	authGroup := app.Group("/v1/auth", dashCORS)
-	authGroup.Post("/register", authH.Register)
-	authGroup.Post("/login",    authH.Login)
-	authGroup.Post("/refresh",  authH.Refresh)
-	authGroup.Post("/logout",   authH.Logout)
+	authRL := middleware.AuthRateLimit()
+	authGroup.Post("/register",        authRL, authH.Register)
+	authGroup.Post("/login",           authRL, authH.Login)
+	authGroup.Post("/refresh",         authH.Refresh)
+	authGroup.Post("/logout",          authH.Logout)
+	authGroup.Post("/forgot-password", middleware.ForgotPasswordRateLimit(), authH.ForgotPassword)
+	authGroup.Post("/reset-password",  authRL, authH.ResetPassword)
+	authGroup.Post("/verify-email",    authRL, authH.VerifyEmail)
 	authGroup.Options("/*", func(c *fiber.Ctx) error { return c.SendStatus(204) })
 
 	// ── Collect endpoints (CORS aberto, API key + domain check) ──────────────
-	collect := app.Group("/v1/collect", middleware.CollectCORS())
+	collect := app.Group("/v1/collect", middleware.CollectCORS(), middleware.CollectRateLimit())
 	collect.Post("/session",    apiKeyAuth, domainCheckMw, collectH.Session)
 	collect.Post("/event",      apiKeyAuth, domainCheckMw, collectH.Event)
 	collect.Post("/identify",   apiKeyAuth, domainCheckMw, collectH.Identify)
 	collect.Post("/conversion", apiKeyAuth, domainCheckMw, rulesH.ClientConversion)
 	collect.Post("/heartbeat",  apiKeyAuth, collectH.Heartbeat)
+	collect.Post("/clicks",     apiKeyAuth, domainCheckMw, heatmapH.Collect)
 	collect.Options("/*", func(c *fiber.Ctx) error { return c.SendStatus(204) })
 
 	// ── Trigger Rules (público — lido pelo tracker.js) ────────────────────────
@@ -108,8 +117,9 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 		collectCORS := middleware.CollectCORS()
 
 		// Collect (API key, CORS aberto — tracker.js)
-		app.Post("/v1/replay/events", collectCORS, apiKeyAuth, replayH.Collect)
-		app.Post("/v1/replay/flush",  collectCORS, apiKeyAuth, replayH.Flush)
+		replayRL := middleware.ReplayRateLimit()
+		app.Post("/v1/replay/events", collectCORS, replayRL, apiKeyAuth, replayH.Collect)
+		app.Post("/v1/replay/flush",  collectCORS, replayRL, apiKeyAuth, replayH.Flush)
 		app.Options("/v1/replay/events", collectCORS, func(c *fiber.Ctx) error { return c.SendStatus(204) })
 		app.Options("/v1/replay/flush",  collectCORS, func(c *fiber.Ctx) error { return c.SendStatus(204) })
 
@@ -119,11 +129,12 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	}
 
 	// ── Webhook endpoints ─────────────────────────────────────────────────────
-	app.Post("/v1/webhooks/:projectKey/:platform", webhookH.Handle)
+	app.Post("/v1/webhooks/:projectKey/:platform", middleware.WebhookRateLimit(), webhookH.Handle)
 
 	// ── /v1/me — JWT-protected, account-scoped ────────────────────────────────
 	me := app.Group("/v1/me", dashCORS, jwtAuth)
 	me.Get("/",                    authH.Me)
+	me.Post("/resend-verification", authH.ResendVerification)
 	me.Get("/projects",            projectsH.List)
 	me.Post("/projects",           projectsH.Create)
 	me.Get("/projects/:id",        projectsH.Get)
@@ -146,6 +157,8 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	dash.Get("/conversions",          dashboardH.Conversions)
 	dash.Get("/sessions",             dashboardH.Sessions)
 	dash.Get("/sessions/:id/events",  dashboardH.SessionEvents)
+	dash.Get("/heatmap",              heatmapH.Get)
+	dash.Get("/live",                 liveH.Stream)
 	dash.Get("/settings",             analyticsH.GetSettings)
 	dash.Put("/settings",             analyticsH.PutSettings)
 	dash.Get("/ad-costs",             analyticsH.ListAdCosts)

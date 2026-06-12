@@ -166,9 +166,12 @@ type integrationDTO struct {
 
 // Secret field names that should be encrypted / redacted in responses.
 var secretFields = map[string]bool{
-	"access_token": true,
-	"api_secret":   true,
-	"pixel_id":     false, // not secret, but keep as-is
+	"access_token":    true,
+	"api_secret":      true,
+	"developer_token": true, // Google Ads
+	"client_secret":   true, // Google Ads OAuth
+	"refresh_token":   true, // Google Ads OAuth
+	"pixel_id":        false, // not secret, but keep as-is
 }
 
 // encryptConfig encrypts secret fields using AES-256-GCM.

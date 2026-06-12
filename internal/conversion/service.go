@@ -11,16 +11,19 @@ import (
 	"github.com/ecsistem/convtrack/internal/integrations/kwai"
 	"github.com/ecsistem/convtrack/internal/integrations/meta"
 	"github.com/ecsistem/convtrack/internal/integrations/tiktok"
+	"github.com/ecsistem/convtrack/internal/live"
 	"github.com/ecsistem/convtrack/internal/models"
 	"github.com/ecsistem/convtrack/internal/queue"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 type Service struct {
 	db          *pgxpool.Pool
 	attribution *attribution.Service
 	queue       *queue.Queue
+	rdb         *redis.Client // opcional, para eventos live
 }
 
 func New(db *pgxpool.Pool, attr *attribution.Service) *Service {
@@ -29,6 +32,12 @@ func New(db *pgxpool.Pool, attr *attribution.Service) *Service {
 
 func NewWithQueue(db *pgxpool.Pool, attr *attribution.Service, q *queue.Queue) *Service {
 	return &Service{db: db, attribution: attr, queue: q}
+}
+
+// WithLive habilita publicação de eventos em tempo real.
+func (s *Service) WithLive(rdb *redis.Client) *Service {
+	s.rdb = rdb
+	return s
 }
 
 type CreateInput struct {
@@ -86,6 +95,14 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*models.Conversio
 	if err != nil {
 		return nil, fmt.Errorf("create conversion: %w", err)
 	}
+
+	// Evento de tempo real para o dashboard (best-effort).
+	live.Publish(ctx, s.rdb, conv.ProjectID, live.Event{
+		Type:  "conversion",
+		Value: conv.Value,
+		Label: conv.Platform,
+	})
+
 	return &conv, nil
 }
 

@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/ecsistem/convtrack/internal/mailer"
 	"github.com/ecsistem/convtrack/internal/models"
 )
 
@@ -48,6 +49,8 @@ type Claims struct {
 type Service struct {
 	db        *pgxpool.Pool
 	jwtSecret []byte
+	mailer    *mailer.Mailer
+	appURL    string
 }
 
 func New(db *pgxpool.Pool) *Service {
@@ -55,7 +58,16 @@ func New(db *pgxpool.Pool) *Service {
 	if secret == "" {
 		secret = "changeme-set-JWT_SECRET-in-production"
 	}
-	return &Service{db: db, jwtSecret: []byte(secret)}
+	appURL := os.Getenv("FRONTEND_ORIGIN")
+	if appURL == "" {
+		appURL = "http://localhost:3000"
+	}
+	return &Service{
+		db:        db,
+		jwtSecret: []byte(secret),
+		mailer:    mailer.New(),
+		appURL:    appURL,
+	}
 }
 
 // ─── Register ─────────────────────────────────────────────────────────────────
@@ -104,6 +116,11 @@ func (s *Service) Register(ctx context.Context, name, email, password string) (*
 	access, refresh, err := s.issueTokens(ctx, &account)
 	if err != nil {
 		return nil, err
+	}
+
+	// Envia email de verificação (best-effort, não bloqueia o cadastro).
+	if vErr := s.SendVerificationEmail(ctx, account.ID, account.Email); vErr != nil {
+		fmt.Printf("warn: send verification email: %v\n", vErr)
 	}
 
 	return &RegisterResult{

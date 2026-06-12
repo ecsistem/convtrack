@@ -301,28 +301,53 @@ func (h *AnalyticsHandler) SyncAdCosts(c *fiber.Ctx) error {
 	end := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	start := end.AddDate(0, 0, -body.Days)
 
+	synced := fiber.Map{}
+
 	// ── Meta ──────────────────────────────────────────────────────────────────
-	accessToken, adAccountID, metaErr := adsync.GetMetaConfig(c.Context(), h.db, project.ID)
-	metaSynced := 0
-	var metaErrMsg string
-	if metaErr == nil {
-		n, err := adsync.SyncMeta(c.Context(), h.db, project.ID, adAccountID, accessToken, start, end)
-		if err != nil {
-			metaErrMsg = err.Error()
-		} else {
-			metaSynced = n
-		}
+	if cfg, err := adsync.LoadConfig(c.Context(), h.db, project.ID, "meta"); err == nil {
+		n, serr := adsync.SyncMeta(c.Context(), h.db, project.ID, cfg["ad_account_id"], cfg["access_token"], start, end)
+		synced["meta"] = syncResult(n, serr)
 	} else {
-		metaErrMsg = metaErr.Error()
+		synced["meta"] = fiber.Map{"rows": 0, "error": err.Error()}
+	}
+
+	// ── Google Ads ────────────────────────────────────────────────────────────
+	if cfg, err := adsync.LoadConfig(c.Context(), h.db, project.ID, "google"); err == nil {
+		n, serr := adsync.SyncGoogle(c.Context(), h.db, project.ID, cfg, start, end)
+		synced["google"] = syncResult(n, serr)
+	} else {
+		synced["google"] = fiber.Map{"rows": 0, "error": err.Error()}
+	}
+
+	// ── TikTok ────────────────────────────────────────────────────────────────
+	if cfg, err := adsync.LoadConfig(c.Context(), h.db, project.ID, "tiktok"); err == nil {
+		n, serr := adsync.SyncTikTok(c.Context(), h.db, project.ID, cfg, start, end)
+		synced["tiktok"] = syncResult(n, serr)
+	} else {
+		synced["tiktok"] = fiber.Map{"rows": 0, "error": err.Error()}
+	}
+
+	// ── Kwai ──────────────────────────────────────────────────────────────────
+	if cfg, err := adsync.LoadConfig(c.Context(), h.db, project.ID, "kwai"); err == nil {
+		n, serr := adsync.SyncKwai(c.Context(), h.db, project.ID, cfg, start, end)
+		synced["kwai"] = syncResult(n, serr)
+	} else {
+		synced["kwai"] = fiber.Map{"rows": 0, "error": err.Error()}
 	}
 
 	return c.JSON(fiber.Map{
-		"ok": true,
-		"synced": fiber.Map{
-			"meta": fiber.Map{"rows": metaSynced, "error": metaErrMsg},
-		},
+		"ok":     true,
+		"synced": synced,
 		"period": fiber.Map{"start": start.Format("2006-01-02"), "end": end.Format("2006-01-02")},
 	})
+}
+
+func syncResult(n int, err error) fiber.Map {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	return fiber.Map{"rows": n, "error": msg}
 }
 
 // GET /v1/dashboard/events?period=30d&name=Purchase&limit=100&offset=0

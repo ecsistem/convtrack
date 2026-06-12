@@ -10,19 +10,28 @@ import (
 
 	"github.com/ecsistem/convtrack/internal/api/middleware"
 	"github.com/ecsistem/convtrack/internal/attribution"
+	"github.com/ecsistem/convtrack/internal/live"
 	"github.com/ecsistem/convtrack/internal/models"
 	"github.com/ecsistem/convtrack/internal/session"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 type CollectHandler struct {
 	sessions    *session.Service
 	attribution *attribution.Service
+	rdb         *redis.Client // opcional, para eventos live
 }
 
 func NewCollect(sessions *session.Service, attr *attribution.Service) *CollectHandler {
 	return &CollectHandler{sessions: sessions, attribution: attr}
+}
+
+// WithLive habilita publicação de eventos em tempo real.
+func (h *CollectHandler) WithLive(rdb *redis.Client) *CollectHandler {
+	h.rdb = rdb
+	return h
 }
 
 type sessionPayload struct {
@@ -128,6 +137,12 @@ func (h *CollectHandler) Session(c *fiber.Ctx) error {
 		_ = h.sessions.UpsertAttribution(c.Context(), attr)
 	}
 
+	// Evento de tempo real para o dashboard (best-effort).
+	live.Publish(c.Context(), h.rdb, project.ID, live.Event{
+		Type:  "session",
+		Label: p.UTMSource,
+	})
+
 	return c.JSON(fiber.Map{
 		"visitor_id": visitorID.String(),
 		"session_id": sess.ID.String(),
@@ -196,6 +211,10 @@ func (h *CollectHandler) Identify(c *fiber.Ctx) error {
 	if p.Phone != "" {
 		hash := attribution.HashIdentifier(p.Phone)
 		_ = h.sessions.RecordIdentifier(c.Context(), project.ID, visitorID, "phone", hash)
+	}
+
+	if p.Email != "" || p.Phone != "" {
+		live.Publish(c.Context(), h.rdb, project.ID, live.Event{Type: "lead"})
 	}
 
 	return c.JSON(fiber.Map{"ok": true})

@@ -384,6 +384,41 @@ rrweb/dist/rrweb.js:
     }, INTERACT_DEBOUNCE);
   }
 
+  // ── Heatmap click buffer ──────────────────────────────────────────────────
+  var _heatmapBuf   = [];
+  var _heatmapTimer = null;
+  var HEATMAP_FLUSH = 10000; // flush a cada 10s
+  var HEATMAP_MAX   = 50;    // ou 50 cliques acumulados
+
+  function flushHeatmap() {
+    if (_heatmapBuf.length === 0) return;
+    var batch = _heatmapBuf.splice(0);
+    send('/v1/collect/clicks', { session_id: sessionId, clicks: batch });
+  }
+
+  function scheduleHeatmapFlush() {
+    clearTimeout(_heatmapTimer);
+    _heatmapTimer = setTimeout(function () { flushHeatmap(); scheduleHeatmapFlush(); }, HEATMAP_FLUSH);
+  }
+  scheduleHeatmapFlush();
+
+  function cssSelector(el) {
+    if (!el || el === document.body || el === document.documentElement) return 'body';
+    if (el.id) return '#' + el.id;
+    var tag = el.tagName.toLowerCase();
+    var cls = (el.className && typeof el.className === 'string') ? '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.') : '';
+    var nth = '';
+    if (el.parentElement) {
+      var siblings = el.parentElement.children;
+      var sameTag = 0, idx = 0;
+      for (var i = 0; i < siblings.length; i++) {
+        if (siblings[i].tagName === el.tagName) { sameTag++; if (siblings[i] === el) idx = sameTag; }
+      }
+      if (sameTag > 1) nth = ':nth-of-type(' + idx + ')';
+    }
+    return tag + cls + nth;
+  }
+
   document.addEventListener('click', function (e) {
     clickCount++;
     var now = Date.now();
@@ -393,7 +428,34 @@ rrweb/dist/rrweb.js:
       if (_rageTs.length >= 3) { rageClicks++; _rageTs = []; }
     } else { _rageTarget = e.target; _rageTs = [now]; }
     scheduleInteractionHeartbeat();
+
+    // Heatmap: captura posição relativa + selector + texto
+    try {
+      var el   = e.target;
+      var rect = el.getBoundingClientRect();
+      var docW = document.documentElement.scrollWidth  || window.innerWidth;
+      var docH = document.documentElement.scrollHeight || window.innerHeight;
+      var text = (el.textContent || el.value || el.alt || '').trim().slice(0, 40);
+      _heatmapBuf.push({
+        x:    Math.round(e.pageX),           // posição absoluta no documento
+        y:    Math.round(e.pageY),
+        xp:   +(e.pageX / docW).toFixed(4),  // posição relativa (0-1)
+        yp:   +(e.pageY / docH).toFixed(4),
+        vw:   window.innerWidth,
+        vh:   window.innerHeight,
+        dw:   docW,
+        dh:   docH,
+        sel:  cssSelector(el),
+        tag:  el.tagName.toLowerCase(),
+        text: text,
+        url:  window.location.pathname,
+        ts:   now,
+      });
+      if (_heatmapBuf.length >= HEATMAP_MAX) { flushHeatmap(); scheduleHeatmapFlush(); }
+    } catch (ex) { /* silencioso */ }
   }, true);
+
+  window.addEventListener('beforeunload', function () { flushHeatmap(); });
 
   document.addEventListener('input', function (e) {
     var tag = (e.target && e.target.tagName || '').toLowerCase();

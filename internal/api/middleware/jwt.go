@@ -63,6 +63,12 @@ func GetAccountID(c *fiber.Ctx) (uuid.UUID, bool) {
 	return id, ok
 }
 
+// GetAccountEmail returns the authenticated account's email from JWT claims.
+func GetAccountEmail(c *fiber.Ctx) string {
+	email, _ := c.Locals("account_email").(string)
+	return email
+}
+
 // RequireProject is a middleware that ensures a project is loaded (X-Project-Id was valid).
 // Use this on routes that need project context.
 func RequireProject(c *fiber.Ctx) error {
