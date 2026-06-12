@@ -13,6 +13,7 @@ import (
 	"github.com/ecsistem/convtrack/internal/db"
 	"github.com/ecsistem/convtrack/internal/migrator"
 	"github.com/ecsistem/convtrack/internal/queue"
+	"github.com/ecsistem/convtrack/internal/retention"
 	convmigrations "github.com/ecsistem/convtrack/migrations"
 	"github.com/joho/godotenv"
 )
@@ -54,6 +55,9 @@ func main() {
 	w := queue.NewWorker(queue.New(rdb.Client()), pool, rdb.Client())
 	go w.Start(workerCtx)
 	fmt.Println("queue worker started")
+
+	// Job de retenção: limpa dados antigos periodicamente.
+	go retention.New(pool).Start(workerCtx)
 
 	port := os.Getenv("PORT")
 	if port == "" {
