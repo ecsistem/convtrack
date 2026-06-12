@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -61,6 +62,9 @@ func (h *ShieldHandler) PutConfig(c *fiber.Ctx) error {
 	if cfg.BlockedIPs == nil {
 		cfg.BlockedIPs = []string{}
 	}
+	if cfg.AllowedSources == nil {
+		cfg.AllowedSources = []string{}
+	}
 
 	if err := h.svc.UpsertConfig(c.Context(), project.ID, &cfg); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
@@ -101,16 +105,24 @@ func (h *ShieldHandler) StreamLogs(c *fiber.Ctx) error {
 
 	heartbeat := time.NewTicker(30 * time.Second)
 
+	// fasthttp recicla o RequestCtx após o handler retornar — não usar
+	// c.Context() dentro do stream writer (vira nil → panic). Usamos context
+	// próprio e detectamos desconexão pelo erro de Flush.
+	streamCtx, cancel := context.WithCancel(context.Background())
+
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 		defer heartbeat.Stop()
+		defer cancel()
 
-		pubsub := h.rdb.Subscribe(c.Context(), channel)
+		pubsub := h.rdb.Subscribe(streamCtx, channel)
 		defer pubsub.Close()
 
 		redisCh := pubsub.Channel()
 
 		fmt.Fprintf(w, "data: {\"connected\":true,\"project_id\":%q}\n\n", project.ID)
-		_ = w.Flush()
+		if err := w.Flush(); err != nil {
+			return
+		}
 
 		for {
 			select {
@@ -127,8 +139,6 @@ func (h *ShieldHandler) StreamLogs(c *fiber.Ctx) error {
 				if err := w.Flush(); err != nil {
 					return
 				}
-			case <-c.Context().Done():
-				return
 			}
 		}
 	})

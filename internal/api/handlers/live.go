@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"time"
 
@@ -40,15 +41,24 @@ func (h *LiveHandler) Stream(c *fiber.Ctx) error {
 
 	heartbeat := time.NewTicker(30 * time.Second)
 
+	// IMPORTANTE: o fasthttp recicla o RequestCtx assim que o handler retorna,
+	// então NÃO se pode usar c.Context() dentro do stream writer (vira nil →
+	// panic). Usamos um context próprio e detectamos desconexão pelo erro de
+	// Flush (disparado no máximo a cada heartbeat).
+	streamCtx, cancel := context.WithCancel(context.Background())
+
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 		defer heartbeat.Stop()
+		defer cancel()
 
-		pubsub := h.rdb.Subscribe(c.Context(), channel)
+		pubsub := h.rdb.Subscribe(streamCtx, channel)
 		defer pubsub.Close()
 		redisCh := pubsub.Channel()
 
 		fmt.Fprintf(w, "data: {\"connected\":true}\n\n")
-		_ = w.Flush()
+		if err := w.Flush(); err != nil {
+			return
+		}
 
 		for {
 			select {
@@ -65,8 +75,6 @@ func (h *LiveHandler) Stream(c *fiber.Ctx) error {
 				if err := w.Flush(); err != nil {
 					return
 				}
-			case <-c.Context().Done():
-				return
 			}
 		}
 	})

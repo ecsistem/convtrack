@@ -604,7 +604,7 @@ func (s *Service) GetGeoStats(ctx context.Context, projectID uuid.UUID, days int
 		FROM shield_visits
 		WHERE project_id = $1
 		  AND city != ''
-		  AND created_at >= NOW() - ($2 || ' days')::INTERVAL
+		  AND created_at >= NOW() - make_interval(days => $2)
 		GROUP BY city, country
 		ORDER BY cnt DESC
 		LIMIT 60

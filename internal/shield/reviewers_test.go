@@ -100,6 +100,49 @@ func TestIsSoftwareRenderer(t *testing.T) {
 	}
 }
 
+func TestCampaignClickIDParams(t *testing.T) {
+	// Múltiplas plataformas → um param por plataforma, sem duplicatas.
+	c := &Campaign{Platforms: []string{"meta", "tiktok", "google"}}
+	got := c.ClickIDParams()
+	want := map[string]bool{"fbclid": true, "ttclid": true, "gclid": true}
+	if len(got) != 3 {
+		t.Fatalf("esperava 3 params, got %v", got)
+	}
+	for _, p := range got {
+		if !want[p] {
+			t.Errorf("param inesperado: %s", p)
+		}
+	}
+
+	// Fallback para platform singular quando platforms vazio.
+	c2 := &Campaign{Platform: "meta"}
+	if g := c2.ClickIDParams(); len(g) != 1 || g[0] != "fbclid" {
+		t.Errorf("fallback singular falhou: %v", g)
+	}
+
+	// Plataforma sem click-id (manual) não gera param.
+	c3 := &Campaign{Platforms: []string{"manual", "meta"}}
+	if g := c3.ClickIDParams(); len(g) != 1 || g[0] != "fbclid" {
+		t.Errorf("manual deveria ser ignorado: %v", g)
+	}
+}
+
+func TestNormalizePlatforms(t *testing.T) {
+	// platform singular deriva o array
+	c := &Campaign{Platform: "tiktok"}
+	c.normalizePlatforms()
+	if len(c.Platforms) != 1 || c.Platforms[0] != "tiktok" {
+		t.Errorf("deveria derivar array de platform: %v", c.Platforms)
+	}
+
+	// platform reflete a primeira do array
+	c2 := &Campaign{Platforms: []string{"google", "kwai"}}
+	c2.normalizePlatforms()
+	if c2.Platform != "google" {
+		t.Errorf("platform deveria ser google, got %q", c2.Platform)
+	}
+}
+
 func TestClickIDParam(t *testing.T) {
 	cases := map[string]string{
 		"meta":     "fbclid",

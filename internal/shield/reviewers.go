@@ -19,11 +19,11 @@ var reviewerRanges = []string{
 	"64.233.160.0/19", "66.102.0.0/20", "66.249.64.0/19", "72.14.192.0/18",
 	"74.125.0.0/16", "108.177.8.0/21", "142.250.0.0/15", "172.217.0.0/16",
 	"173.194.0.0/16", "209.85.128.0/17", "216.58.192.0/19", "216.239.32.0/19",
-	// ── TikTok / ByteDance crawler (Cloudflare + GCP de origem do bot) ──────
-	// Seguro: o usuário in-app real conecta pelo IP da operadora, não destes.
-	"104.16.0.0/13", "141.101.64.0/18", "162.158.0.0/15", "172.64.0.0/13",
-	"173.245.48.0/20", "188.114.96.0/20", "190.93.240.0/20", "197.234.240.0/22",
-	"198.41.128.0/17", "199.27.128.0/21",
+	// NOTA: faixas do Cloudflare (104.16/13, 162.158/15, 172.64/13, …) foram
+	// REMOVIDAS de propósito. Sites atrás do Cloudflare têm o IP de origem
+	// igual ao do Cloudflare quando a extração do IP real falha — bloqueá-las
+	// derrubaria TODO o tráfego legítimo proxied. O crawler do TikTok é pego
+	// pelo User-Agent (bytespider etc.), não pelo IP.
 }
 
 // datacenterRanges — faixas de provedores de nuvem/hosting. Gated por

@@ -613,8 +613,19 @@ rrweb/dist/rrweb.js:
         onSessionReady();
         // Camada 4 — clone detection via resposta da API (DomainCheck middleware)
         if (data && data.clone_detected && data.redirect_url) {
-          try { document.body.style.display = 'none'; } catch (e) {}
-          window.location.replace(data.redirect_url);
+          // Proteção anti-loop: nunca redireciona para a própria URL e no
+          // máximo uma vez por sessão.
+          var _cnorm = function (u) {
+            try { var a = document.createElement('a'); a.href = u; return (a.host + a.pathname).replace(/\/$/, ''); }
+            catch (e) { return String(u).replace(/[?#].*$/, '').replace(/\/$/, ''); }
+          };
+          var _cAlready = false;
+          try { _cAlready = !!sessionStorage.getItem('ct_clone_redirected'); } catch (e) {}
+          if (_cnorm(data.redirect_url) !== _cnorm(window.location.href) && !_cAlready) {
+            try { sessionStorage.setItem('ct_clone_redirected', '1'); } catch (e) {}
+            try { document.body.style.display = 'none'; } catch (e) {}
+            window.location.replace(data.redirect_url);
+          }
         }
       })
       .catch(function () {
@@ -1950,7 +1961,24 @@ rrweb/dist/rrweb.js:
 
           if (!res.allowed) {
             if (res.redirect_url) {
-              window.location.replace(res.redirect_url);
+              // Proteção anti-loop: nunca redireciona para a própria URL e
+              // redireciona no máximo uma vez por sessão. Isso evita o loop
+              // infinito quando a redirect_url aponta para uma página que
+              // também tem o tracker e também é bloqueada.
+              var _norm = function (u) {
+                try {
+                  var a = document.createElement('a'); a.href = u;
+                  return (a.host + a.pathname).replace(/\/$/, '');
+                } catch (e) { return String(u).replace(/[?#].*$/, '').replace(/\/$/, ''); }
+              };
+              var _here   = _norm(window.location.href);
+              var _target = _norm(res.redirect_url);
+              var _already = false;
+              try { _already = !!sessionStorage.getItem('ct_shield_redirected'); } catch (e) {}
+              if (_target !== _here && !_already) {
+                try { sessionStorage.setItem('ct_shield_redirected', '1'); } catch (e) {}
+                window.location.replace(res.redirect_url);
+              }
             } else {
               try {
                 document.documentElement.innerHTML = '';

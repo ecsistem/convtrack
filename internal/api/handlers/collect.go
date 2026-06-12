@@ -89,7 +89,7 @@ func (h *CollectHandler) Session(c *fiber.Ctx) error {
 	}
 
 	// Upsert session
-	ip := c.IP()
+	ip := middleware.ClientIP(c)
 	ua := p.UserAgent
 	if ua == "" {
 		ua = c.Get("User-Agent")

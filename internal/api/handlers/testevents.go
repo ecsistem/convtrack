@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"time"
 
@@ -41,18 +42,26 @@ func (h *TestEventsHandler) Stream(c *fiber.Ctx) error {
 	// heartbeat a cada 30s para manter a conexão viva
 	heartbeatTicker := time.NewTicker(30 * time.Second)
 
+	// fasthttp recicla o RequestCtx após o handler retornar — não usar
+	// c.Context() dentro do stream writer (vira nil → panic). Usamos context
+	// próprio e detectamos desconexão pelo erro de Flush.
+	streamCtx, cancel := context.WithCancel(context.Background())
+
 	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 		defer heartbeatTicker.Stop()
+		defer cancel()
 
 		// Cria um subscriber Redis dedicado para esta conexão
-		pubsub := h.rdb.Subscribe(c.Context(), channel)
+		pubsub := h.rdb.Subscribe(streamCtx, channel)
 		defer pubsub.Close()
 
 		redisCh := pubsub.Channel()
 
 		// Avisa o cliente que o stream está pronto
 		fmt.Fprintf(w, "data: {\"connected\":true,\"project_id\":%q}\n\n", project.ID)
-		_ = w.Flush()
+		if err := w.Flush(); err != nil {
+			return
+		}
 
 		for {
 			select {
@@ -71,9 +80,6 @@ func (h *TestEventsHandler) Stream(c *fiber.Ctx) error {
 				if err := w.Flush(); err != nil {
 					return
 				}
-
-			case <-c.Context().Done():
-				return
 			}
 		}
 	})

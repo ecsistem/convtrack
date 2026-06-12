@@ -54,12 +54,22 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 		return c.Redirect(safeURL, fiber.StatusFound)
 	}
 	if campaign.RequireClickID {
-		if param := shield.ClickIDParam(campaign.Platform); param != "" && c.Query(param) == "" {
-			safeURL := campaign.SafeURL
-			if safeURL == "" {
-				safeURL = "https://google.com"
+		params := campaign.ClickIDParams() // um por plataforma selecionada
+		if len(params) > 0 {
+			hasClickID := false
+			for _, param := range params {
+				if c.Query(param) != "" {
+					hasClickID = true
+					break
+				}
 			}
-			return c.Redirect(safeURL, fiber.StatusFound)
+			if !hasClickID {
+				safeURL := campaign.SafeURL
+				if safeURL == "" {
+					safeURL = "https://google.com"
+				}
+				return c.Redirect(safeURL, fiber.StatusFound)
+			}
 		}
 	}
 
@@ -432,7 +442,13 @@ func (h *ShieldHandler) CreateDomain(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
 	}
 	d.ProjectID = p.ID
+	if d.CampaignID == uuid.Nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "campaign_id obrigatório"})
+	}
 	created, err := h.svc.CreateDomain(c.Context(), &d)
+	if err == shield.ErrDomainOwnedByOther {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}

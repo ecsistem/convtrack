@@ -71,9 +71,10 @@ func (r *Runner) runOnce(ctx context.Context) {
 
 	// Sessões: preserva as que geraram conversão (FK em conversions sem CASCADE).
 	// As dependências (attributions, interactions, replays) caem por CASCADE.
+	// A tabela sessions usa started_at (não created_at).
 	r.delete(ctx, "sessions", `
 		DELETE FROM sessions
-		WHERE created_at < $1
+		WHERE started_at < $1
 		  AND id NOT IN (SELECT session_id FROM conversions WHERE session_id IS NOT NULL)`,
 		cutoff)
 

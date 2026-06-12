@@ -3,6 +3,7 @@ package shield
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
 	"regexp"
 	"strings"
@@ -23,7 +24,7 @@ func sanitizeSlug(s string) string {
 }
 
 // ClickIDParam retorna o nome do parâmetro de click-id esperado para a
-// plataforma da campanha. Vazio = plataforma sem click-id padrão.
+// plataforma. Vazio = plataforma sem click-id padrão.
 func ClickIDParam(platform string) string {
 	switch strings.ToLower(platform) {
 	case "meta", "facebook", "instagram":
@@ -39,6 +40,48 @@ func ClickIDParam(platform string) string {
 	}
 }
 
+// effectivePlatforms retorna as plataformas da campanha (platforms[], com
+// fallback para o campo singular platform).
+func (c *Campaign) effectivePlatforms() []string {
+	if len(c.Platforms) > 0 {
+		return c.Platforms
+	}
+	if c.Platform != "" {
+		return []string{c.Platform}
+	}
+	return nil
+}
+
+// ClickIDParams retorna a lista de parâmetros de click-id aceitos pela
+// campanha (um por plataforma selecionada), sem duplicatas.
+func (c *Campaign) ClickIDParams() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range c.effectivePlatforms() {
+		if param := ClickIDParam(p); param != "" && !seen[param] {
+			seen[param] = true
+			out = append(out, param)
+		}
+	}
+	return out
+}
+
+// normalizePlatforms garante que platforms não é nil e que platform (singular)
+// espelha a primeira plataforma — mantendo compatibilidade.
+func (c *Campaign) normalizePlatforms() {
+	if c.Platforms == nil {
+		c.Platforms = []string{}
+	}
+	// se só veio o singular, deriva o array
+	if len(c.Platforms) == 0 && c.Platform != "" {
+		c.Platforms = []string{c.Platform}
+	}
+	// platform singular reflete a primeira da lista
+	if len(c.Platforms) > 0 {
+		c.Platform = c.Platforms[0]
+	}
+}
+
 // ── Campaign ──────────────────────────────────────────────────────────────
 
 // Campaign define as URLs e parâmetros de uma campanha de proteção.
@@ -51,7 +94,8 @@ type Campaign struct {
 	MoneyURL      string    `json:"money_url"      db:"money_url"`       // exibida para humanos reais
 	SplitPct      int       `json:"split_pct"      db:"split_pct"`       // % de humanos → money_url
 	Enabled       bool      `json:"enabled"        db:"enabled"`
-	Platform       string    `json:"platform"        db:"platform"`        // meta|tiktok|kwai|google|taboola|manual
+	Platform       string    `json:"platform"        db:"platform"`        // primária (compat) — espelha platforms[0]
+	Platforms      []string  `json:"platforms"       db:"platforms"`       // múltiplas fontes: meta|tiktok|kwai|google
 	ChallengeMode  string    `json:"challenge_mode"  db:"challenge_mode"`  // redirect|captcha|both
 	RequireKey     bool      `json:"require_key"     db:"require_key"`     // exige ?_sk=access_key
 	AccessKey      string    `json:"access_key"      db:"access_key"`      // chave secreta gerada
@@ -84,13 +128,14 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 	if c.ChallengeMode == "" {
 		c.ChallengeMode = "redirect"
 	}
+	c.normalizePlatforms()
 	_, err := s.db.Exec(ctx, `
 		INSERT INTO shield_campaigns
 		  (id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
-		   platform, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+		   platform, platforms, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		c.ID, c.ProjectID, c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
-		c.Platform, c.ChallengeMode, c.RequireKey, c.AccessKey, c.UnderReview, c.RequireTtclid, c.RequireClickID,
+		c.Platform, c.Platforms, c.ChallengeMode, c.RequireKey, c.AccessKey, c.UnderReview, c.RequireTtclid, c.RequireClickID,
 	)
 	if err != nil {
 		return nil, err
@@ -103,7 +148,7 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Campaign, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
-		       platform, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid,
+		       platform, platforms, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid,
 		       created_at, updated_at
 		FROM shield_campaigns WHERE project_id = $1 ORDER BY created_at DESC`, projectID)
 	if err != nil {
@@ -115,7 +160,7 @@ func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Cam
 	for rows.Next() {
 		var c Campaign
 		if err := rows.Scan(&c.ID, &c.ProjectID, &c.Name, &c.Slug, &c.SafeURL, &c.MoneyURL,
-			&c.SplitPct, &c.Enabled, &c.Platform, &c.ChallengeMode,
+			&c.SplitPct, &c.Enabled, &c.Platform, &c.Platforms, &c.ChallengeMode,
 			&c.RequireKey, &c.AccessKey, &c.UnderReview, &c.RequireTtclid, &c.RequireClickID,
 			&c.CreatedAt, &c.UpdatedAt); err != nil {
 			continue
@@ -136,14 +181,15 @@ func (s *Service) UpdateCampaign(ctx context.Context, c *Campaign) error {
 	if c.ChallengeMode == "" {
 		c.ChallengeMode = "redirect"
 	}
+	c.normalizePlatforms()
 	_, err := s.db.Exec(ctx, `
 		UPDATE shield_campaigns
 		SET name=$1, slug=$2, safe_url=$3, money_url=$4, split_pct=$5, enabled=$6,
-		    platform=$7, challenge_mode=$8, require_key=$9, access_key=$10,
-		    under_review=$11, require_ttclid=$12, require_clickid=$13, updated_at=NOW()
-		WHERE id=$14 AND project_id=$15`,
+		    platform=$7, platforms=$8, challenge_mode=$9, require_key=$10, access_key=$11,
+		    under_review=$12, require_ttclid=$13, require_clickid=$14, updated_at=NOW()
+		WHERE id=$15 AND project_id=$16`,
 		c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
-		c.Platform, c.ChallengeMode, c.RequireKey, c.AccessKey,
+		c.Platform, c.Platforms, c.ChallengeMode, c.RequireKey, c.AccessKey,
 		c.UnderReview, c.RequireTtclid, c.RequireClickID, c.ID, c.ProjectID,
 	)
 	return err
@@ -185,17 +231,35 @@ func (s *Service) ListDomains(ctx context.Context, projectID uuid.UUID) ([]Domai
 	return list, nil
 }
 
+// ErrDomainOwnedByOther indica que o domínio já pertence a outro projeto.
+var ErrDomainOwnedByOther = fmt.Errorf("domínio já cadastrado por outro projeto")
+
+// CreateDomain cria um domínio OU, se já existir no mesmo projeto, reassocia-o
+// à campanha informada (upsert). Permite "escolher um domínio configurado"
+// direto da campanha, inclusive no cadastro. Se o domínio pertencer a outro
+// projeto, retorna ErrDomainOwnedByOther.
 func (s *Service) CreateDomain(ctx context.Context, d *Domain) (*Domain, error) {
 	d.ID = uuid.New()
 	d.CreatedAt = time.Now()
-	_, err := s.db.Exec(ctx, `
+	var returnedID uuid.UUID
+	err := s.db.QueryRow(ctx, `
 		INSERT INTO shield_domains (id, project_id, campaign_id, domain, ssl_enabled)
-		VALUES ($1,$2,$3,$4,$5)`,
+		VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (domain) DO UPDATE
+		  SET campaign_id = EXCLUDED.campaign_id,
+		      ssl_enabled = EXCLUDED.ssl_enabled
+		  WHERE shield_domains.project_id = EXCLUDED.project_id
+		RETURNING id`,
 		d.ID, d.ProjectID, d.CampaignID, d.Domain, d.SSLEnabled,
-	)
+	).Scan(&returnedID)
 	if err != nil {
+		// Sem linha retornada = conflito com domínio de outro projeto.
+		if err.Error() == "no rows in result set" {
+			return nil, ErrDomainOwnedByOther
+		}
 		return nil, err
 	}
+	d.ID = returnedID
 	if s.rdb != nil {
 		_ = s.rdb.Del(ctx, "shield_domain:"+d.Domain)
 	}
@@ -279,12 +343,12 @@ func (s *Service) ResolveCampaignBySlug(ctx context.Context, slug string) (*Camp
 	var c Campaign
 	err := s.db.QueryRow(ctx, `
 		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
-		       platform, challenge_mode, require_key, access_key,
+		       platform, platforms, challenge_mode, require_key, access_key,
 		       under_review, require_ttclid, require_clickid, created_at, updated_at
 		FROM shield_campaigns
 		WHERE slug = $1 AND enabled = true`, slug,
 	).Scan(&c.ID, &c.ProjectID, &c.Name, &c.Slug, &c.SafeURL, &c.MoneyURL,
-		&c.SplitPct, &c.Enabled, &c.Platform, &c.ChallengeMode,
+		&c.SplitPct, &c.Enabled, &c.Platform, &c.Platforms, &c.ChallengeMode,
 		&c.RequireKey, &c.AccessKey, &c.UnderReview, &c.RequireTtclid, &c.RequireClickID,
 		&c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
