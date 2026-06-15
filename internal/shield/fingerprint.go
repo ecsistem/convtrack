@@ -201,6 +201,8 @@ func (s *Service) ProcessFingerprint(ctx context.Context, projectID uuid.UUID, i
 	if !isBot {
 		result.Allowed = true
 		result.Action = "money"
+		// Rotatividade de link: destino sorteado do pool (primary + fallbacks).
+		result.RedirectURL = pickRotationURL(cfg)
 
 		// Registra visita humana em shield_visits
 		go s.insertVisit(context.Background(), projectID, VisitRecord{
@@ -213,6 +215,15 @@ func (s *Service) ProcessFingerprint(ctx context.Context, projectID uuid.UUID, i
 			Signals:   signals,
 			Action:    "money",
 		})
+		// Log "permitido" (verde no dashboard).
+		go s.insertLog(context.Background(), &models.ShieldLog{
+			IP:        ip,
+			UserAgent: ua,
+			Country:   country,
+			Device:    device,
+			Reason:    "human",
+			Action:    "allowed",
+		}, projectID)
 	} else {
 		result.Allowed = false
 		if cfg.RedirectURL != "" {

@@ -73,6 +73,20 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 		}
 	}
 
+	// ── 0d. Origem real (ignora utm_source, valida o Referer) ──────────────
+	// Quando origin_only está ativo, o clique precisa vir de fato de uma das
+	// plataformas da campanha (pelo Referer). utm_source é ignorado por ser
+	// forjável.
+	if campaign.OriginOnly {
+		if !campaign.OriginMatches(c.Get("Referer")) {
+			safeURL := campaign.SafeURL
+			if safeURL == "" {
+				safeURL = "https://google.com"
+			}
+			return c.Redirect(safeURL, fiber.StatusFound)
+		}
+	}
+
 	// ── 1. Chave de acesso secreta ──────────────────────────────────────────
 	if campaign.RequireKey && campaign.AccessKey != "" {
 		if c.Query("_sk") != campaign.AccessKey {
@@ -829,18 +843,16 @@ func (h *ShieldHandler) SmartRedirectAdvanced(c *fiber.Ctx) error {
 		return c.Status(200).SendString("")
 	}
 
-	// Humano (ou incerto) → serve página de fingerprinting
+	// Humano (ou incerto) → serve página de fingerprinting.
+	// FALLBACK também sai do pool de rotação (usado se o fingerprint falhar).
 	cfg, _ := h.svc.GetConfig(c.Context(), p.ID)
-	primaryURL := ""
-	if cfg != nil {
-		primaryURL = cfg.PrimaryURL
-	}
+	fallbackURL := h.svc.RotationURL(cfg)
 
 	apiBase := h.svc.APIBase
 	apiKey := c.Params("projectKey")
 
 	// Página HTML que coleta fingerprint e redireciona
-	html := buildFPRedirectPage(apiBase, apiKey, primaryURL)
+	html := buildFPRedirectPage(apiBase, apiKey, fallbackURL)
 	c.Set("Content-Type", "text/html; charset=utf-8")
 	return c.SendString(html)
 }

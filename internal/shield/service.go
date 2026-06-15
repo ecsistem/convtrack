@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -358,6 +359,7 @@ func (s *Service) Check(ctx context.Context, projectID uuid.UUID, req CheckReque
 	// Omite quando SkipVisit=true (ex: pré-filtro rápido do SmartRedirectAdvanced
 	// que é seguido de ProcessFingerprint, o qual registra a visita completa).
 	if !req.SkipVisit {
+		device := deviceFromUA(req.UserAgent)
 		go s.insertVisit(context.Background(), projectID, VisitRecord{
 			IP:        req.IP,
 			UserAgent: req.UserAgent,
@@ -365,16 +367,25 @@ func (s *Service) Check(ctx context.Context, projectID uuid.UUID, req CheckReque
 			City:      ipInfo.City,
 			Lat:       ipInfo.Lat,
 			Lon:       ipInfo.Lon,
-			Device:    deviceFromUA(req.UserAgent),
+			Device:    device,
 			IsBot:     false,
 			BotScore:  0,
 			Signals:   []string{},
 			Action:    "money",
 		})
+		// Registra também no log de eventos como "permitido" (verde no dashboard).
+		go s.insertLog(context.Background(), &models.ShieldLog{
+			IP:        req.IP,
+			UserAgent: req.UserAgent,
+			Country:   ipInfo.Country,
+			Device:    device,
+			Reason:    "human",
+			Action:    "allowed",
+		}, projectID)
 		// Dispara evento "visit" para webhooks que assinam este evento
 		go s.FireWebhooks(context.Background(), projectID, EventVisit, map[string]interface{}{
 			"ip":         req.IP,
-			"device":     deviceFromUA(req.UserAgent),
+			"device":     device,
 			"user_agent": req.UserAgent,
 		})
 	}
@@ -573,13 +584,41 @@ func (s *Service) SmartRedirect(ctx context.Context, projectID uuid.UUID, req Ch
 	result, _ := s.Check(ctx, projectID, req)
 	if result == nil || result.Allowed {
 		cfg, _ := s.GetConfig(ctx, projectID)
-		if cfg != nil && cfg.PrimaryURL != "" {
-			return cfg.PrimaryURL, false
-		}
-		return "", false
+		return pickRotationURL(cfg), false
 	}
 	// bloqueado
 	return result.RedirectURL, true
+}
+
+// RotationURL expõe o sorteio de link (rotatividade) para os handlers.
+func (s *Service) RotationURL(cfg *models.ShieldConfig) string {
+	return pickRotationURL(cfg)
+}
+
+// pickRotationURL implementa a rotatividade de link: escolhe aleatoriamente
+// uma URL do pool (primary_url + fallback_urls não vazios). Cada visitante
+// permitido cai em um destino, distribuindo o tráfego entre os links.
+func pickRotationURL(cfg *models.ShieldConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	pool := make([]string, 0, len(cfg.FallbackURLs)+1)
+	if u := strings.TrimSpace(cfg.PrimaryURL); u != "" {
+		pool = append(pool, u)
+	}
+	for _, u := range cfg.FallbackURLs {
+		if t := strings.TrimSpace(u); t != "" {
+			pool = append(pool, t)
+		}
+	}
+	switch len(pool) {
+	case 0:
+		return ""
+	case 1:
+		return pool[0]
+	default:
+		return pool[rand.IntN(len(pool))]
+	}
 }
 
 // ── Geo Stats ──────────────────────────────────────────────────────────────

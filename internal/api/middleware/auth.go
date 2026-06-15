@@ -20,6 +20,10 @@ func APIKey(db *pgxpool.Pool, rdb *cache.Cache) fiber.Handler {
 		if apiKey == "" {
 			apiKey = c.Query("api_key")
 		}
+		// Rotas com a chave no path (ex.: /r/:projectKey — link de redirect).
+		if apiKey == "" {
+			apiKey = c.Params("projectKey")
+		}
 		// sendBeacon não suporta headers customizados — lê do body JSON
 		if apiKey == "" && len(c.Body()) > 0 {
 			var body struct {

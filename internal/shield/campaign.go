@@ -52,6 +52,39 @@ func (c *Campaign) effectivePlatforms() []string {
 	return nil
 }
 
+// platformToSource normaliza uma plataforma da campanha para o vocabulário do
+// detectSource ("meta"/"tiktok"/"kwai"/"google").
+func platformToSource(platform string) string {
+	switch strings.ToLower(platform) {
+	case "meta", "facebook", "instagram":
+		return "meta"
+	case "google", "youtube":
+		return "google"
+	case "tiktok":
+		return "tiktok"
+	case "kwai":
+		return "kwai"
+	default:
+		return ""
+	}
+}
+
+// OriginMatches verifica se o Referer indica uma das plataformas da campanha,
+// ignorando o utm_source. Usado quando origin_only está ativo. Retorna false
+// para origem desconhecida/ausente (clique sem Referer não pode ser validado).
+func (c *Campaign) OriginMatches(referer string) bool {
+	src := detectSource(referer, "") // só o Referer, sem utm
+	if src == "direct" {
+		return false
+	}
+	for _, p := range c.effectivePlatforms() {
+		if platformToSource(p) == src {
+			return true
+		}
+	}
+	return false
+}
+
 // ClickIDParams retorna a lista de parâmetros de click-id aceitos pela
 // campanha (um por plataforma selecionada), sem duplicatas.
 func (c *Campaign) ClickIDParams() []string {
@@ -102,6 +135,7 @@ type Campaign struct {
 	UnderReview    bool      `json:"under_review"    db:"under_review"`    // modo análise: todos veem safe_url
 	RequireTtclid  bool      `json:"require_ttclid"  db:"require_ttclid"`  // legado: exige ?ttclid= (TikTok)
 	RequireClickID bool      `json:"require_clickid" db:"require_clickid"` // exige o click-id da plataforma (fbclid/gclid/ttclid/clickid)
+	OriginOnly     bool      `json:"origin_only"     db:"origin_only"`     // valida a origem real (Referer) e ignora o utm_source
 	CreatedAt      time.Time `json:"created_at"      db:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"      db:"updated_at"`
 }
@@ -132,10 +166,10 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 	_, err := s.db.Exec(ctx, `
 		INSERT INTO shield_campaigns
 		  (id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
-		   platform, platforms, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+		   platform, platforms, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid, origin_only)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
 		c.ID, c.ProjectID, c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
-		c.Platform, c.Platforms, c.ChallengeMode, c.RequireKey, c.AccessKey, c.UnderReview, c.RequireTtclid, c.RequireClickID,
+		c.Platform, c.Platforms, c.ChallengeMode, c.RequireKey, c.AccessKey, c.UnderReview, c.RequireTtclid, c.RequireClickID, c.OriginOnly,
 	)
 	if err != nil {
 		return nil, err
@@ -148,7 +182,7 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Campaign, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
-		       platform, platforms, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid,
+		       platform, platforms, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid, origin_only,
 		       created_at, updated_at
 		FROM shield_campaigns WHERE project_id = $1 ORDER BY created_at DESC`, projectID)
 	if err != nil {
@@ -161,7 +195,7 @@ func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Cam
 		var c Campaign
 		if err := rows.Scan(&c.ID, &c.ProjectID, &c.Name, &c.Slug, &c.SafeURL, &c.MoneyURL,
 			&c.SplitPct, &c.Enabled, &c.Platform, &c.Platforms, &c.ChallengeMode,
-			&c.RequireKey, &c.AccessKey, &c.UnderReview, &c.RequireTtclid, &c.RequireClickID,
+			&c.RequireKey, &c.AccessKey, &c.UnderReview, &c.RequireTtclid, &c.RequireClickID, &c.OriginOnly,
 			&c.CreatedAt, &c.UpdatedAt); err != nil {
 			continue
 		}
@@ -186,11 +220,11 @@ func (s *Service) UpdateCampaign(ctx context.Context, c *Campaign) error {
 		UPDATE shield_campaigns
 		SET name=$1, slug=$2, safe_url=$3, money_url=$4, split_pct=$5, enabled=$6,
 		    platform=$7, platforms=$8, challenge_mode=$9, require_key=$10, access_key=$11,
-		    under_review=$12, require_ttclid=$13, require_clickid=$14, updated_at=NOW()
-		WHERE id=$15 AND project_id=$16`,
+		    under_review=$12, require_ttclid=$13, require_clickid=$14, origin_only=$15, updated_at=NOW()
+		WHERE id=$16 AND project_id=$17`,
 		c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
 		c.Platform, c.Platforms, c.ChallengeMode, c.RequireKey, c.AccessKey,
-		c.UnderReview, c.RequireTtclid, c.RequireClickID, c.ID, c.ProjectID,
+		c.UnderReview, c.RequireTtclid, c.RequireClickID, c.OriginOnly, c.ID, c.ProjectID,
 	)
 	return err
 }
@@ -344,12 +378,12 @@ func (s *Service) ResolveCampaignBySlug(ctx context.Context, slug string) (*Camp
 	err := s.db.QueryRow(ctx, `
 		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
 		       platform, platforms, challenge_mode, require_key, access_key,
-		       under_review, require_ttclid, require_clickid, created_at, updated_at
+		       under_review, require_ttclid, require_clickid, origin_only, created_at, updated_at
 		FROM shield_campaigns
 		WHERE slug = $1 AND enabled = true`, slug,
 	).Scan(&c.ID, &c.ProjectID, &c.Name, &c.Slug, &c.SafeURL, &c.MoneyURL,
 		&c.SplitPct, &c.Enabled, &c.Platform, &c.Platforms, &c.ChallengeMode,
-		&c.RequireKey, &c.AccessKey, &c.UnderReview, &c.RequireTtclid, &c.RequireClickID,
+		&c.RequireKey, &c.AccessKey, &c.UnderReview, &c.RequireTtclid, &c.RequireClickID, &c.OriginOnly,
 		&c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err

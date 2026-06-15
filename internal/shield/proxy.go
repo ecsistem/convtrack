@@ -13,6 +13,24 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
+// realClientIP extrai o IP real do visitante respeitando proxies reversos
+// (Cloudflare, nginx) — essencial quando o site está atrás de um proxy.
+func realClientIP(c *fiber.Ctx) string {
+	if v := c.Get("CF-Connecting-IP"); v != "" {
+		return v
+	}
+	if v := c.Get("X-Real-IP"); v != "" {
+		return v
+	}
+	if xff := c.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i > 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	return c.IP()
+}
+
 // DomainProxyMiddleware é um middleware Fiber que intercepta requisições para domínios
 // registrados em shield_domains e as roteia como proxy reverso.
 // Para domínios não registrados, chama c.Next() sem interferir.
@@ -28,7 +46,7 @@ func (s *Service) DomainProxyMiddleware(c *fiber.Ctx) error {
 		return c.Next() // não é um domínio do Shield — deixa passar
 	}
 
-	ip := c.IP()
+	ip := realClientIP(c)
 	ua := c.Get("User-Agent")
 
 	// ── Verificação rápida server-side ────────────────────────────────
