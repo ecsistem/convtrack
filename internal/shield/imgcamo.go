@@ -35,6 +35,12 @@ const (
 	// A IA classifica pela estrutura global (capa); humanos veem o criativo original.
 	// Requer CoverImage no CamoRequest.
 	TechCoverBlend CamoTechnique = "cover_blend"
+
+	// TechMeshOverlay — sobrepõe uma grade ondulada (malha) sobre a imagem com
+	// opacidade ajustável. As linhas de alta frequência distribuídas quebram a
+	// análise estrutural de CNNs; em opacidades baixas (~2%) é quase invisível
+	// para humanos. Usa Opacity no CamoRequest (0–1, default 0.02).
+	TechMeshOverlay CamoTechnique = "mesh_overlay"
 )
 
 // CamoRequest é a entrada do serviço de camuflagem.
@@ -46,6 +52,7 @@ type CamoRequest struct {
 	Seed       uint64        // semente para reprodutibilidade (0 = aleatório)
 	CoverImage []byte        // imagem de capa para TechCoverBlend (PNG ou JPEG)
 	BlurRadius int           // raio do blur de separação de frequência (default 8, range 2–30)
+	Opacity    float64       // opacidade da malha para TechMeshOverlay (0–1, default 0.02)
 }
 
 // CamoResult é a saída com a imagem perturbada.
@@ -132,6 +139,12 @@ func CamouflageImage(req CamoRequest) (*CamoResult, error) {
 			alpha := 0.05 + float64(eps-1)*0.02 // eps=1→5%, eps=15→33%
 			applyCoverBlend(dst, cover, bounds, radius, alpha)
 		}
+	case TechMeshOverlay:
+		op := req.Opacity
+		if op <= 0 {
+			op = 0.02 // 2% por padrão
+		}
+		applyMeshOverlay(dst, bounds, op)
 	}
 
 	// ── Mede invisibilidade ─────────────────────────────────────────
@@ -324,6 +337,82 @@ func applyCoverBlend(dst *image.NRGBA, cover image.Image, bounds image.Rectangle
 				G: clamp8(int(blendG) + hiG),
 				B: clamp8(int(blendB) + hiB),
 				A: orig.A,
+			})
+		}
+	}
+}
+
+// ── Mesh Overlay ──────────────────────────────────────────────────────────────
+
+// applyMeshOverlay sobrepõe uma grade ondulada (malha) sobre a imagem com a
+// opacidade indicada (0–1).
+//
+// Princípio: a malha adiciona um padrão regular de linhas de alta frequência
+// distribuído por toda a imagem. Modelos de visão dependem de bordas/texturas
+// coerentes para classificar o conteúdo; a grade introduz "ruído estrutural"
+// que confunde essa análise. Com opacidade baixa (~2%) o olho humano mal percebe
+// as linhas, mas elas alteram consistentemente o sinal que a IA recebe.
+//
+// A grade é ondulada (deslocamento senoidal) para evitar que filtros simples de
+// remoção de grade regular a eliminem.
+func applyMeshOverlay(dst *image.NRGBA, bounds image.Rectangle, opacity float64) {
+	if opacity <= 0 {
+		return
+	}
+	if opacity > 1 {
+		opacity = 1
+	}
+	const (
+		cell    = 22.0 // espaçamento entre linhas (px)
+		amp     = 3.0  // amplitude da ondulação (px)
+		wlen    = 90.0 // comprimento de onda da distorção (px)
+		half    = 0.6  // meia-espessura da linha (px)
+		feather = 1.0  // suavização de borda (anti-alias)
+		lineLum = 40.0 // luminância da linha (cinza escuro)
+	)
+
+	// distância ao centro da linha mais próxima (grade de período `cell`)
+	lineDist := func(coord float64) float64 {
+		r := math.Mod(coord, cell)
+		if r < 0 {
+			r += cell
+		}
+		if cell-r < r {
+			r = cell - r
+		}
+		return r
+	}
+
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		fy := float64(y - bounds.Min.Y)
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			fx := float64(x - bounds.Min.X)
+
+			// deslocamento ondulado das coordenadas
+			wx := fx + amp*math.Sin(fy/wlen)
+			wy := fy + amp*math.Sin(fx/wlen)
+
+			d := math.Min(lineDist(wx), lineDist(wy))
+
+			// intensidade da malha neste pixel (1 sobre a linha, 0 fora)
+			var m float64
+			switch {
+			case d <= half:
+				m = 1
+			case d < half+feather:
+				m = 1 - (d-half)/feather
+			}
+			if m == 0 {
+				continue
+			}
+
+			a := opacity * m
+			c := dst.NRGBAAt(x, y)
+			dst.SetNRGBA(x, y, color.NRGBA{
+				R: clamp8(int(float64(c.R)*(1-a) + lineLum*a)),
+				G: clamp8(int(float64(c.G)*(1-a) + lineLum*a)),
+				B: clamp8(int(float64(c.B)*(1-a) + lineLum*a)),
+				A: c.A,
 			})
 		}
 	}

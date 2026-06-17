@@ -75,6 +75,7 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	shieldH       := handlers.NewShield(shieldSvc, rawRedis)
 	heatmapH      := handlers.NewHeatmap(heatmapSvc)
 	liveH         := handlers.NewLive(rawRedis)
+	cloneH        := handlers.NewClone()
 
 	// ── Middleware factories ───────────────────────────────────────────────────
 	apiKeyAuth    := middleware.APIKey(db, rdb)
@@ -235,6 +236,9 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	dash.Post("/shield/imgcamo",           shieldH.CamouflageImage)
 	// Camuflagem adversarial de vídeo (frame a frame via ffmpeg)
 	dash.Post("/shield/videocamo",         shieldH.CamouflageVideo)
+
+	// Clonador de ofertas (download de página + assets em .zip)
+	dash.Post("/clone",                    cloneH.CloneOffer)
 
 	// ── Proxy reverso por domínio (catch-all — deve ficar APÓS todas as rotas) ─
 	// Habilitado apenas se API_BASE_URL estiver configurado

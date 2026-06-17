@@ -1,0 +1,12 @@
+.git
+.gitignore
+bin
+*.log
+*.test
+.env
+deploy.sh
+deploy.env
+deploy.env.example
+.DS_Store
+.vscode
+.idea

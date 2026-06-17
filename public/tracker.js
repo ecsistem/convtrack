@@ -679,6 +679,9 @@ rrweb/dist/rrweb.js:
     getAllowedDomain: function () { return allowedDomain; },
   };
 
+  // Alias da marca Cloakhide (mantém window.ConvTrack por compatibilidade).
+  window.Cloakhide = window.ConvTrack;
+
   // ── Unified SPA navigation dispatcher ────────────────────────────────────
   // FIX #2: Uma única camada de patches em history.pushState/replaceState.
   // Outros módulos (replay, rules) registram callbacks aqui, em vez de

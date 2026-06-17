@@ -1,0 +1,46 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  Caddy — produção Cloakhide
+#  - cloakhide.com.br            → dashboard (web)
+#  - cloaker.cloakhide.com.br    → API + cloaker (links /r/ e /slug)
+#  - qualquer outro domínio      → On-Demand TLS → API (domínios de clientes)
+#
+#  Pré-requisito DNS (registros A apontando para o IP do servidor):
+#     cloakhide.com.br          A   <IP>
+#     www.cloakhide.com.br      A   <IP>
+#     cloaker.cloakhide.com.br  A   <IP>
+#  E, para cada domínio de cliente: CNAME → cloaker.cloakhide.com.br
+# ════════════════════════════════════════════════════════════════════════════
+
+{
+	email {$CADDY_EMAIL:ssl@cloakhide.com.br}
+
+	# On-Demand TLS para domínios de clientes (cloaking sem redirect visível)
+	on_demand_tls {
+		ask http://api:8080/v1/shield/domain-ask
+	}
+}
+
+# ── Dashboard (frontend) ─────────────────────────────────────────────────────
+cloakhide.com.br, www.cloakhide.com.br {
+	encode gzip zstd
+	reverse_proxy web:3000
+}
+
+# ── API + cloaker ────────────────────────────────────────────────────────────
+cloaker.cloakhide.com.br {
+	encode gzip zstd
+	reverse_proxy api:8080
+}
+
+# ── Catch-all HTTPS — domínios de clientes via CNAME (On-Demand TLS) ─────────
+:443 {
+	tls {
+		on_demand
+	}
+	reverse_proxy api:8080
+}
+
+# ── HTTP → HTTPS ─────────────────────────────────────────────────────────────
+:80 {
+	redir https://{host}{uri} 308
+}

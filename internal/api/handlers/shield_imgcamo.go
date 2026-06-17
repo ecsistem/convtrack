@@ -89,6 +89,15 @@ func (h *ShieldHandler) CamouflageImage(c *fiber.Ctx) error {
 		fmt.Sscanf(v, "%d", &blurRadius)
 	}
 
+	// Opacidade da malha (técnica mesh_overlay). Aceita fração 0–1.
+	opacity := 0.0
+	if v := c.FormValue("opacity"); v != "" {
+		fmt.Sscanf(v, "%f", &opacity)
+	}
+	if opacity < 0 || opacity > 1 {
+		opacity = 0
+	}
+
 	// ── Imagem de capa (opcional) ────────────────────────────────────
 	var coverData []byte
 	coverFiles := form.File["cover"]
@@ -116,6 +125,7 @@ func (h *ShieldHandler) CamouflageImage(c *fiber.Ctx) error {
 		Technique:  tech,
 		CoverImage: coverData,
 		BlurRadius: blurRadius,
+		Opacity:    opacity,
 		Epsilon:    eps,
 		Seed:      rand.Uint64(),
 	})
@@ -133,10 +143,11 @@ func (h *ShieldHandler) CamouflageImage(c *fiber.Ctx) error {
 	c.Set("X-Camo-MeanDelta", fmt.Sprintf("%.2f", result.MeanDelta))
 	c.Set("X-Camo-PSNR", fmt.Sprintf("%.1f", result.PSNR))
 	c.Set("X-Camo-Technique", string(tech))
+	c.Set("X-Camo-Opacity", fmt.Sprintf("%.4f", opacity))
 	c.Set("X-Image-Width", fmt.Sprintf("%d", result.OrigWidth))
 	c.Set("X-Image-Height", fmt.Sprintf("%d", result.OrigHeight))
 	c.Set("Access-Control-Expose-Headers",
-		"X-Camo-Epsilon,X-Camo-MaxDelta,X-Camo-MeanDelta,X-Camo-PSNR,X-Camo-Technique,X-Image-Width,X-Image-Height")
+		"X-Camo-Epsilon,X-Camo-MaxDelta,X-Camo-MeanDelta,X-Camo-PSNR,X-Camo-Technique,X-Camo-Opacity,X-Image-Width,X-Image-Height")
 
 	return c.Send(result.ImageData)
 }

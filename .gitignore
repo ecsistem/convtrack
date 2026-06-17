@@ -1,0 +1,4 @@
+deploy.env
+.env
+bin/
+.env.production
