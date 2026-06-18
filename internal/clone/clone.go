@@ -74,6 +74,12 @@ var (
 	reCSSURL  = regexp.MustCompile(`(?is)url\(\s*["']?([^"')]+)["']?\s*\)`)
 	reCSSImp  = regexp.MustCompile(`(?is)@import\s+["']([^"']+)["']`)
 	reDataURI = regexp.MustCompile(`(?i)^data:`)
+
+	// Reescrita restrita a valores de atributos (evita substituição global perigosa).
+	reAttrURLDq = regexp.MustCompile(`(?is)(\b(?:href|src|poster|data-src|data-lazy-src)\s*=\s*")([^"]*)(")`)
+	reAttrURLSq = regexp.MustCompile(`(?is)(\b(?:href|src|poster|data-src|data-lazy-src)\s*=\s*')([^']*)(')`)
+	reSrcsetDq  = regexp.MustCompile(`(?is)(\bsrcset\s*=\s*")([^"]*)(")`)
+	reSrcsetSq  = regexp.MustCompile(`(?is)(\bsrcset\s*=\s*')([^']*)(')`)
 )
 
 // extensões que NÃO são páginas HTML (não devem entrar na fila de crawl).
@@ -480,42 +486,77 @@ func (d *downloader) fetchNestedCSS(css string, cssURL *url.URL) {
 
 // ── Reescrita ─────────────────────────────────────────────────────────────────
 
-// rewritePage reescreve, numa página, as referências de assets (para a pasta
-// assets/, relativa à profundidade da página) e os links internos <a href>
-// (para o arquivo local da página de destino). Links externos viram absolutos.
+// rewritePage reescreve, numa página, as referências de assets (para assets/,
+// relativo à profundidade da página) e os links internos (para o arquivo local
+// da página de destino). Links externos/não rastreados viram absolutos.
+//
+// A reescrita acontece SOMENTE dentro de valores de atributos (href/src/srcset/
+// poster) e de url() de CSS — nunca por substituição global de texto, que poderia
+// corromper o HTML (ex.: um link "/" destruir todos os "/" do documento).
 func rewritePage(p page, assetAbs map[string]string, pageByKey map[string]string) string {
 	dir := path.Dir(p.local)
-	pairs := map[string]string{}
 
-	// assets
-	for raw := range extractHTMLRefs(p.html) {
-		abs := resolveRef(p.url, raw)
-		if local, ok := assetAbs[abs]; ok {
-			pairs[raw] = relPath(dir, local)
+	mapRef := func(raw string) string {
+		t := strings.TrimSpace(raw)
+		if t == "" || strings.HasPrefix(t, "#") || reDataURI.MatchString(t) ||
+			strings.HasPrefix(t, "javascript:") || strings.HasPrefix(t, "mailto:") ||
+			strings.HasPrefix(t, "tel:") {
+			return raw
 		}
-	}
-
-	// links internos <a href>
-	for _, m := range reAnchor.FindAllStringSubmatch(p.html, -1) {
-		raw := strings.TrimSpace(m[1])
-		if raw == "" || strings.HasPrefix(raw, "#") || reDataURI.MatchString(raw) ||
-			strings.HasPrefix(raw, "javascript:") || strings.HasPrefix(raw, "mailto:") ||
-			strings.HasPrefix(raw, "tel:") {
-			continue
-		}
-		abs := resolveRef(p.url, raw)
+		abs := resolveRef(p.url, t)
 		if abs == "" {
-			continue
+			return raw
+		}
+		if local, ok := assetAbs[abs]; ok {
+			return relPath(dir, local)
 		}
 		if local, ok := pageByKey[abs]; ok {
-			pairs[raw] = relPath(dir, local)
-		} else if _, isAsset := pairs[raw]; !isAsset {
-			// página não rastreada / externa → mantém clicável (absoluta)
-			pairs[raw] = abs
+			return relPath(dir, local)
 		}
+		return abs // externo / não rastreado → mantém clicável (absoluto)
 	}
 
-	return applyReplacements(p.html, pairs)
+	s := p.html
+
+	// href/src/poster (aspas duplas e simples)
+	rewriteAttr := func(s string, re *regexp.Regexp) string {
+		return re.ReplaceAllStringFunc(s, func(m string) string {
+			sub := re.FindStringSubmatch(m)
+			return sub[1] + mapRef(sub[2]) + sub[3]
+		})
+	}
+	s = rewriteAttr(s, reAttrURLDq)
+	s = rewriteAttr(s, reAttrURLSq)
+
+	// srcset: lista "url descritor, url descritor"
+	rewriteSrcset := func(s string, re *regexp.Regexp) string {
+		return re.ReplaceAllStringFunc(s, func(m string) string {
+			sub := re.FindStringSubmatch(m)
+			parts := strings.Split(sub[2], ",")
+			for i, part := range parts {
+				fields := strings.Fields(strings.TrimSpace(part))
+				if len(fields) == 0 {
+					continue
+				}
+				fields[0] = mapRef(fields[0])
+				parts[i] = " " + strings.Join(fields, " ")
+			}
+			return sub[1] + strings.TrimPrefix(strings.Join(parts, ","), " ") + sub[3]
+		})
+	}
+	s = rewriteSrcset(s, reSrcsetDq)
+	s = rewriteSrcset(s, reSrcsetSq)
+
+	// url() em <style> e style="" inline
+	s = reCSSURL.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reCSSURL.FindStringSubmatch(m)
+		if sub == nil {
+			return m
+		}
+		return "url(\"" + mapRef(sub[1]) + "\")"
+	})
+
+	return s
 }
 
 func rewriteCSS(css string, cssURL *url.URL, absToFile map[string]string) string {

@@ -93,6 +93,15 @@ func (h *ShieldHandler) CamouflageVideo(c *fiber.Ctx) error {
 		fmt.Sscanf(v, "%d", &blurRadius) //nolint:errcheck
 	}
 
+	// ── Limpeza de metadados + compressão ───────────────────────────────────
+	stripMeta := c.FormValue("strip_metadata") == "true" || c.FormValue("strip_metadata") == "1"
+	compression := c.FormValue("compression", "none")
+	switch compression {
+	case "none", "light", "medium", "high":
+	default:
+		compression = "none"
+	}
+
 	// ── Imagem de capa (opcional) ───────────────────────────────────────────
 	var coverData []byte
 	if coverFiles := form.File["cover"]; len(coverFiles) > 0 {
@@ -111,13 +120,15 @@ func (h *ShieldHandler) CamouflageVideo(c *fiber.Ctx) error {
 
 	// ── Processa ────────────────────────────────────────────────────────────
 	result, err := shield.CamouflageVideo(shield.CamoVideoRequest{
-		VideoData:  videoData,
-		MimeType:   mime,
-		Technique:  tech,
-		Epsilon:    eps,
-		Seed:       rand.Uint64(),
-		CoverImage: coverData,
-		BlurRadius: blurRadius,
+		VideoData:     videoData,
+		MimeType:      mime,
+		Technique:     tech,
+		Epsilon:       eps,
+		Seed:          rand.Uint64(),
+		CoverImage:    coverData,
+		BlurRadius:    blurRadius,
+		StripMetadata: stripMeta,
+		Compression:   compression,
 	})
 	if err != nil {
 		return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{

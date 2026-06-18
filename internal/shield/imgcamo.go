@@ -45,14 +45,31 @@ const (
 
 // CamoRequest é a entrada do serviço de camuflagem.
 type CamoRequest struct {
-	ImageData  []byte        // dados brutos da imagem (PNG ou JPEG)
-	MimeType   string        // "image/png" ou "image/jpeg"
-	Technique  CamoTechnique // algoritmo de perturbação
-	Epsilon    int           // intensidade: 1–15 (quanto maior, mais robusta a perturbação)
-	Seed       uint64        // semente para reprodutibilidade (0 = aleatório)
-	CoverImage []byte        // imagem de capa para TechCoverBlend (PNG ou JPEG)
-	BlurRadius int           // raio do blur de separação de frequência (default 8, range 2–30)
-	Opacity    float64       // opacidade da malha para TechMeshOverlay (0–1, default 0.02)
+	ImageData   []byte        // dados brutos da imagem (PNG ou JPEG)
+	MimeType    string        // "image/png" ou "image/jpeg"
+	Technique   CamoTechnique // algoritmo de perturbação
+	Epsilon     int           // intensidade: 1–15 (quanto maior, mais robusta a perturbação)
+	Seed        uint64        // semente para reprodutibilidade (0 = aleatório)
+	CoverImage  []byte        // imagem de capa para TechCoverBlend (PNG ou JPEG)
+	BlurRadius  int           // raio do blur de separação de frequência (default 8, range 2–30)
+	Opacity     float64       // opacidade da malha para TechMeshOverlay (0–1, default 0.02)
+	Compression string        // "none" | "light" | "medium" | "high" (qualidade do JPEG de saída)
+}
+
+// jpegQuality mapeia o nível de compressão para a qualidade JPEG (1–100).
+// "none" = qualidade alta (preserva a perturbação). Sempre re-codifica, então
+// a saída nunca carrega EXIF/metadados da imagem original.
+func jpegQuality(level string) int {
+	switch strings.ToLower(level) {
+	case "light":
+		return 85
+	case "medium":
+		return 75
+	case "high":
+		return 60
+	default: // none
+		return 95
+	}
 }
 
 // CamoResult é a saída com a imagem perturbada.
@@ -62,9 +79,9 @@ type CamoResult struct {
 	OrigWidth  int
 	OrigHeight int
 	// Métricas de invisibilidade
-	MaxDelta   int     // maior diferença de pixel (0–255)
-	MeanDelta  float64 // diferença média por pixel
-	PSNR       float64 // Peak Signal-to-Noise Ratio em dB (>40 dB = imperceptível)
+	MaxDelta  int     // maior diferença de pixel (0–255)
+	MeanDelta float64 // diferença média por pixel
+	PSNR      float64 // Peak Signal-to-Noise Ratio em dB (>40 dB = imperceptível)
 }
 
 // CamouflageImage aplica perturbação adversarial imperceptível à imagem.
@@ -157,14 +174,22 @@ func CamouflageImage(req CamoRequest) (*CamoResult, error) {
 		mimeOut = "image/png"
 	}
 
+	compress := strings.ToLower(req.Compression) != "" && strings.ToLower(req.Compression) != "none"
+
 	if strings.Contains(mimeOut, "jpeg") || strings.Contains(mimeOut, "jpg") {
-		// JPEG: qualidade 95 preserva a perturbação
-		if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 95}); err != nil {
+		// JPEG: re-codifica (sem EXIF/metadados). A compressão controla a qualidade.
+		if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: jpegQuality(req.Compression)}); err != nil {
 			return nil, err
 		}
 	} else {
+		// PNG é sem perdas: a "compressão" só ajusta o nível de empacotamento.
 		mimeOut = "image/png"
-		if err := png.Encode(&buf, dst); err != nil {
+		level := png.DefaultCompression
+		if compress {
+			level = png.BestCompression
+		}
+		enc := png.Encoder{CompressionLevel: level}
+		if err := enc.Encode(&buf, dst); err != nil {
 			return nil, err
 		}
 	}
@@ -471,7 +496,6 @@ func boxBlur(src *image.NRGBA, bounds image.Rectangle, r int) [][3]int {
 	}
 	return out
 }
-
 
 // resizeNearest redimensiona src para (w, h) usando interpolação nearest-neighbor
 // e retorna um *image.NRGBA com bounds (0,0)-(w,h).

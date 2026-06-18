@@ -22,7 +22,8 @@ FROM alpine:3.20
 # TLS certs + timezone + ffmpeg (camuflagem de vídeo frame a frame)
 # + chromium (renderização de SPAs no clonador de ofertas)
 RUN apk --no-cache add ca-certificates tzdata ffmpeg \
-    chromium nss freetype harfbuzz ttf-freefont font-noto-emoji
+    chromium nss freetype harfbuzz ttf-freefont font-noto-emoji \
+    espeak-ng
 
 # Caminho do binário do Chromium usado pelo chromedp
 ENV CHROME_BIN=/usr/bin/chromium-browser

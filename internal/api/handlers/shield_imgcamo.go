@@ -98,6 +98,15 @@ func (h *ShieldHandler) CamouflageImage(c *fiber.Ctx) error {
 		opacity = 0
 	}
 
+	// Nível de compressão da imagem de saída (a saída sempre é re-codificada
+	// sem EXIF/metadados; este nível controla a qualidade do JPEG).
+	compression := c.FormValue("compression", "none")
+	switch compression {
+	case "none", "light", "medium", "high":
+	default:
+		compression = "none"
+	}
+
 	// ── Imagem de capa (opcional) ────────────────────────────────────
 	var coverData []byte
 	coverFiles := form.File["cover"]
@@ -120,14 +129,15 @@ func (h *ShieldHandler) CamouflageImage(c *fiber.Ctx) error {
 
 	// ── Processa ────────────────────────────────────────────────────
 	result, err := shield.CamouflageImage(shield.CamoRequest{
-		ImageData:  imgData,
-		MimeType:   mime,
-		Technique:  tech,
-		CoverImage: coverData,
-		BlurRadius: blurRadius,
-		Opacity:    opacity,
-		Epsilon:    eps,
-		Seed:      rand.Uint64(),
+		ImageData:   imgData,
+		MimeType:    mime,
+		Technique:   tech,
+		CoverImage:  coverData,
+		BlurRadius:  blurRadius,
+		Opacity:     opacity,
+		Compression: compression,
+		Epsilon:     eps,
+		Seed:        rand.Uint64(),
 	})
 	if err != nil {
 		return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{
