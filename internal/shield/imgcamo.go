@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/jpeg"
 	"image/png"
 	"math"
 	"math/rand/v2"
 	"strings"
+
+	xdraw "golang.org/x/image/draw"
 )
 
 // CamoTechnique representa o algoritmo de perturbação adversarial.
@@ -54,6 +57,45 @@ type CamoRequest struct {
 	BlurRadius  int           // raio do blur de separação de frequência (default 8, range 2–30)
 	Opacity     float64       // opacidade da malha para TechMeshOverlay (0–1, default 0.02)
 	Compression string        // "none" | "light" | "medium" | "high" (qualidade do JPEG de saída)
+	Resize      string        // "" | "9:16" | "1:1" | "16:9" | "4:5" — cover em 720p
+}
+
+// resizeDims devolve as dimensões alvo (720p) para um formato. ok=false = sem resize.
+func resizeDims(format string) (w, h int, ok bool) {
+	switch format {
+	case "9:16":
+		return 720, 1280, true
+	case "1:1":
+		return 720, 720, true
+	case "16:9":
+		return 1280, 720, true
+	case "4:5":
+		return 720, 900, true
+	default:
+		return 0, 0, false
+	}
+}
+
+// coverResize redimensiona a imagem para (w,h) preenchendo o quadro (cover):
+// escala para cobrir e recorta o centro — sem barras pretas.
+func coverResize(src image.Image, w, h int) *image.NRGBA {
+	sb := src.Bounds()
+	sw, sh := sb.Dx(), sb.Dy()
+	if sw == 0 || sh == 0 {
+		return image.NewNRGBA(image.Rect(0, 0, w, h))
+	}
+	scale := math.Max(float64(w)/float64(sw), float64(h)/float64(sh))
+	scaledW := int(math.Round(float64(sw) * scale))
+	scaledH := int(math.Round(float64(sh) * scale))
+
+	scaled := image.NewNRGBA(image.Rect(0, 0, scaledW, scaledH))
+	xdraw.CatmullRom.Scale(scaled, scaled.Bounds(), src, sb, xdraw.Over, nil)
+
+	ox := (scaledW - w) / 2
+	oy := (scaledH - h) / 2
+	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
+	draw.Draw(dst, dst.Bounds(), scaled, image.Pt(ox, oy), draw.Src)
+	return dst
 }
 
 // jpegQuality mapeia o nível de compressão para a qualidade JPEG (1–100).
@@ -93,6 +135,11 @@ func CamouflageImage(req CamoRequest) (*CamoResult, error) {
 		return nil, err
 	}
 	_ = fmt
+
+	// ── Redimensionamento opcional (cover, 720p, sem barras) ────────
+	if rw, rh, ok := resizeDims(req.Resize); ok {
+		orig = coverResize(orig, rw, rh)
+	}
 
 	bounds := orig.Bounds()
 	w, h := bounds.Max.X, bounds.Max.Y

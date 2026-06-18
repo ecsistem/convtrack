@@ -107,6 +107,14 @@ func (h *ShieldHandler) CamouflageImage(c *fiber.Ctx) error {
 		compression = "none"
 	}
 
+	// Redimensionamento opcional (cover 720p, sem barras).
+	resize := c.FormValue("resize", "")
+	switch resize {
+	case "9:16", "1:1", "16:9", "4:5":
+	default:
+		resize = ""
+	}
+
 	// ── Imagem de capa (opcional) ────────────────────────────────────
 	var coverData []byte
 	coverFiles := form.File["cover"]
@@ -136,6 +144,7 @@ func (h *ShieldHandler) CamouflageImage(c *fiber.Ctx) error {
 		BlurRadius:  blurRadius,
 		Opacity:     opacity,
 		Compression: compression,
+		Resize:      resize,
 		Epsilon:     eps,
 		Seed:        rand.Uint64(),
 	})

@@ -291,6 +291,13 @@ func CamouflageVideo(req CamoVideoRequest) (*CamoVideoResult, error) {
 	}
 	srcHasAudio := hasAudioStream(inputPath)
 	vf := buildVideoFilter(req)
+	if rf := buildResizeFilter(req.Resize); rf != "" {
+		if vf != "" {
+			vf += "," + rf
+		} else {
+			vf = rf
+		}
+	}
 
 	args := []string{
 		"-framerate", fpsStr,

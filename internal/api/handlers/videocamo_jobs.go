@@ -134,6 +134,14 @@ func (h *VideoCamoJobsHandler) Enqueue(c *fiber.Ctx) error {
 		compression = "none"
 	}
 
+	// ── Redimensionamento (opcional) ─────────────────────────────────────────
+	resize := c.FormValue("resize", "")
+	switch resize {
+	case "9:16", "1:1", "16:9", "4:5":
+	default:
+		resize = ""
+	}
+
 	// ── Tópico de áudio (prompt injection) ──────────────────────────────────
 	topic := c.FormValue("topic", "")
 	if topic != "" {
@@ -169,6 +177,7 @@ func (h *VideoCamoJobsHandler) Enqueue(c *fiber.Ctx) error {
 		Saturation:     saturation,
 		FilterStrength: filterStrength,
 		Opacity:        opacity,
+		Resize:         resize,
 	}
 
 	job, err := h.queue.Enqueue(project.ID.String(), vfh.Filename, videoExt(mime), videoData, req, preset, topic)
