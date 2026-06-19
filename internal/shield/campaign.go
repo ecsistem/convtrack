@@ -3,13 +3,16 @@ package shield
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"math/rand/v2"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var slugRe = regexp.MustCompile(`[^a-z0-9\-]`)
@@ -158,25 +161,54 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 	if c.SplitPct <= 0 || c.SplitPct > 100 {
 		c.SplitPct = 100
 	}
-	c.Slug = sanitizeSlug(c.Slug)
+	originalSlug := sanitizeSlug(c.Slug)
+	c.Slug = originalSlug
 	if c.ChallengeMode == "" {
 		c.ChallengeMode = "redirect"
 	}
 	c.normalizePlatforms()
-	_, err := s.db.Exec(ctx, `
-		INSERT INTO shield_campaigns
-		  (id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
-		   platform, platforms, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid, origin_only)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
-		c.ID, c.ProjectID, c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
-		c.Platform, c.Platforms, c.ChallengeMode, c.RequireKey, c.AccessKey, c.UnderReview, c.RequireTtclid, c.RequireClickID, c.OriginOnly,
-	)
-	if err != nil {
+
+	const maxAttempts = 6
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 && originalSlug != "" {
+			c.Slug = randomSlugPrefix() + "-" + originalSlug
+		}
+		_, err := s.db.Exec(ctx, `
+			INSERT INTO shield_campaigns
+			  (id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
+			   platform, platforms, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid, origin_only)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+			c.ID, c.ProjectID, c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
+			c.Platform, c.Platforms, c.ChallengeMode, c.RequireKey, c.AccessKey, c.UnderReview, c.RequireTtclid, c.RequireClickID, c.OriginOnly,
+		)
+		if err == nil {
+			c.CreatedAt = time.Now()
+			c.UpdatedAt = c.CreatedAt
+			return c, nil
+		}
+		if isUniqueSlugViolation(err) && originalSlug != "" {
+			continue
+		}
 		return nil, err
 	}
-	c.CreatedAt = time.Now()
-	c.UpdatedAt = c.CreatedAt
-	return c, nil
+	return nil, fmt.Errorf("não foi possível gerar um slug único para '%s'", originalSlug)
+}
+
+// randomSlugPrefix gera um prefixo aleatório de 5 caracteres alfanuméricos.
+func randomSlugPrefix() string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 5)
+	for i := range b {
+		b[i] = chars[rand.IntN(len(chars))]
+	}
+	return string(b)
+}
+
+// isUniqueSlugViolation verifica se o erro é violação de unique constraint no slug.
+func isUniqueSlugViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" &&
+		strings.Contains(pgErr.ConstraintName, "slug")
 }
 
 func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Campaign, error) {
