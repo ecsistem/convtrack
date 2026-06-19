@@ -10,6 +10,7 @@ import (
 	"github.com/ecsistem/convtrack/internal/api/middleware"
 	"github.com/ecsistem/convtrack/internal/attribution"
 	"github.com/ecsistem/convtrack/internal/auth"
+	"github.com/ecsistem/convtrack/internal/billing"
 	"github.com/ecsistem/convtrack/internal/cache"
 	"github.com/ecsistem/convtrack/internal/conversion"
 	"github.com/ecsistem/convtrack/internal/heatmap"
@@ -70,13 +71,19 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	rulesSvc := rules.New(db)
 	rulesH := handlers.NewRules(rulesSvc, convSvc)
 	analyticsH := handlers.NewAnalytics(analyticsSvc, sessionSvc, convSvc, db)
-	authH := handlers.NewAuth(authSvc)
+	authH := handlers.NewAuth(authSvc, db)
 	projectsH := handlers.NewProjects(authSvc)
 	integrationsH := handlers.NewIntegrations(db)
-	shieldH := handlers.NewShield(shieldSvc, rawRedis)
+	shieldH := handlers.NewShield(shieldSvc, rawRedis, db)
 	heatmapH := handlers.NewHeatmap(heatmapSvc)
 	liveH := handlers.NewLive(rawRedis)
-	cloneH := handlers.NewClone()
+	cloneH     := handlers.NewClone(db)
+	adminH     := handlers.NewAdmin(db)
+	affiliateH := handlers.NewAffiliate(db)
+
+	// Billing (PixUp)
+	billingSvc := billing.New(db)
+	billingH   := handlers.NewBilling(billingSvc)
 
 	// Fila assíncrona de camuflagem de vídeo (workers em background)
 	var videoJobsH *handlers.VideoCamoJobsHandler
@@ -144,6 +151,7 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	// ── /v1/me — JWT-protected, account-scoped ────────────────────────────────
 	me := app.Group("/v1/me", dashCORS, jwtAuth)
 	me.Get("/", authH.Me)
+	me.Get("/usage", authH.Usage)
 	me.Post("/resend-verification", authH.ResendVerification)
 	me.Get("/projects", projectsH.List)
 	me.Post("/projects", projectsH.Create)
@@ -243,6 +251,8 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	dash.Get("/shield/geo", shieldH.GeoStats)
 	// Camuflagem adversarial de imagem
 	dash.Post("/shield/imgcamo", shieldH.CamouflageImage)
+	// Camuflagem de imagem em lote (N variações → .zip)
+	dash.Post("/shield/imgcamo/batch", shieldH.BatchCamouflageImage)
 	// Camuflagem adversarial de vídeo (frame a frame via ffmpeg)
 	dash.Post("/shield/videocamo", shieldH.CamouflageVideo)
 
@@ -256,6 +266,34 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 
 	// Clonador de ofertas (download de página + assets em .zip)
 	dash.Post("/clone", cloneH.CloneOffer)
+
+	// ── Admin (requer is_admin=true no JWT) ───────────────────────────────────
+	adminMw := middleware.AdminOrManager(authSvc)
+	admin := app.Group("/v1/admin", dashCORS, jwtAuth, adminMw)
+	admin.Get("/stats",            adminH.Stats)
+	admin.Get("/accounts",         adminH.ListAccounts)
+	admin.Get("/accounts/:id",     adminH.GetAccount)
+	admin.Put("/accounts/:id",     adminH.UpdateAccount)
+	admin.Delete("/accounts/:id",  adminH.DeleteAccount)
+	admin.Get("/affiliates",          affiliateH.AdminList)
+	admin.Post("/affiliates",         affiliateH.AdminCreate)
+	admin.Put("/affiliates/:id",      affiliateH.AdminUpdate)
+	admin.Delete("/affiliates/:id",   affiliateH.AdminDelete)
+	admin.Post("/affiliates/:id/payout", affiliateH.AdminPayout)
+	admin.Options("/*", func(c *fiber.Ctx) error { return c.SendStatus(204) })
+
+	// ── Billing (PixUp) ────────────────────────────────────────────────────────
+	billing_ := app.Group("/v1/billing", dashCORS)
+	billing_.Post("/checkout",     jwtAuth, billingH.Checkout)
+	billing_.Get("/subscription",  jwtAuth, billingH.Subscription)
+	billing_.Post("/webhook",      billingH.Webhook) // public — HMAC validated
+	billing_.Options("/*", func(c *fiber.Ctx) error { return c.SendStatus(204) })
+
+	// ── Affiliate (usuário) ────────────────────────────────────────────────────
+	aff := app.Group("/v1/affiliate", dashCORS, jwtAuth)
+	aff.Get("/me",        affiliateH.Me)
+	aff.Get("/referrals", affiliateH.Referrals)
+	aff.Options("/*", func(c *fiber.Ctx) error { return c.SendStatus(204) })
 
 	// ── Proxy reverso por domínio (catch-all — deve ficar APÓS todas as rotas) ─
 	// Habilitado apenas se API_BASE_URL estiver configurado

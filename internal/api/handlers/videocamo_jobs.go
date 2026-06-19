@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"strings"
 
 	"github.com/ecsistem/convtrack/internal/api/middleware"
@@ -164,7 +165,19 @@ func (h *VideoCamoJobsHandler) Enqueue(c *fiber.Ctx) error {
 		tech = shield.TechCoverBlend
 	}
 
-	req := shield.CamoVideoRequest{
+	// ── Lote: quantas variações gerar (cada uma vira um anúncio diferente) ──
+	count := 1
+	if v := c.FormValue("count"); v != "" {
+		fmt.Sscanf(v, "%d", &count) //nolint:errcheck
+	}
+	if count < 1 {
+		count = 1
+	}
+	if count > 10 {
+		count = 10
+	}
+
+	base := shield.CamoVideoRequest{
 		MimeType:       mime,
 		Technique:      tech,
 		Epsilon:        eps,
@@ -180,11 +193,45 @@ func (h *VideoCamoJobsHandler) Enqueue(c *fiber.Ctx) error {
 		Resize:         resize,
 	}
 
-	job, err := h.queue.Enqueue(project.ID.String(), vfh.Filename, videoExt(mime), videoData, req, preset, topic)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "falha ao enfileirar: " + err.Error()})
+	jobs := make([]videojobs.Job, 0, count)
+	for i := 0; i < count; i++ {
+		req := base
+		req.Seed = rand.Uint64() // perturbação única por variação → hash diferente
+		if count > 1 {
+			req.Saturation = jitterSaturation(base.Saturation, i) // leve variação de cor
+		}
+		name := vfh.Filename
+		if count > 1 {
+			name = fmt.Sprintf("v%02d_%s", i+1, vfh.Filename)
+		}
+		job, err := h.queue.Enqueue(project.ID.String(), name, videoExt(mime), videoData, req, preset, topic)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "falha ao enfileirar: " + err.Error()})
+		}
+		jobs = append(jobs, job)
 	}
-	return c.Status(fiber.StatusAccepted).JSON(job)
+	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"data": jobs})
+}
+
+// jitterSaturation aplica uma leve variação determinística de saturação por índice
+// de variação, mantendo dentro de 0.5–1.5.
+func jitterSaturation(base float64, i int) float64 {
+	if base <= 0 {
+		base = 1.0
+	}
+	// deslocamento em passos de ~3% alternando sinal: -3%, +3%, -6%, +6%, …
+	step := 0.03 * float64((i+2)/2)
+	if i%2 == 1 {
+		step = -step
+	}
+	v := base + step
+	if v < 0.5 {
+		v = 0.5
+	}
+	if v > 1.5 {
+		v = 1.5
+	}
+	return v
 }
 
 // List godoc — GET /v1/dashboard/shield/videocamo/jobs

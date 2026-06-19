@@ -12,6 +12,11 @@ type Account struct {
 	Email          string    `json:"email" db:"email"`
 	Plan           string    `json:"plan" db:"plan"`
 	SessionsQuota  int       `json:"sessions_quota" db:"sessions_quota"`
+	IsAdmin        bool      `json:"is_admin" db:"is_admin"`
+	IsManager      bool      `json:"is_manager" db:"is_manager"`
+	IsAffiliate    bool      `json:"is_affiliate" db:"is_affiliate"`
+	Status         string    `json:"status" db:"status"` // approved | pending | suspended
+	EmailVerified  bool      `json:"email_verified" db:"email_verified"`
 	CreatedAt      time.Time `json:"created_at" db:"created_at"`
 	// Auth fields (migration 007) — never included in JSON API responses
 	PasswordHash   string    `json:"-" db:"password_hash"`

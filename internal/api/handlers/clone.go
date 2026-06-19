@@ -5,15 +5,20 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/ecsistem/convtrack/internal/api/middleware"
 	"github.com/ecsistem/convtrack/internal/clone"
+	"github.com/ecsistem/convtrack/internal/plans"
 	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // CloneHandler expõe o módulo de clonagem de ofertas.
-type CloneHandler struct{}
+type CloneHandler struct {
+	db *pgxpool.Pool
+}
 
 // NewClone cria o handler de clonagem.
-func NewClone() *CloneHandler { return &CloneHandler{} }
+func NewClone(db *pgxpool.Pool) *CloneHandler { return &CloneHandler{db: db} }
 
 type cloneRequest struct {
 	URL    string `json:"url"`
@@ -29,6 +34,18 @@ var slugSanitize = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 // Recebe { "url": "https://oferta.com" }, clona a página (HTML + assets),
 // reescreve as referências para caminhos locais e devolve um arquivo .zip.
 func (h *CloneHandler) CloneOffer(c *fiber.Ctx) error {
+	// Plan check — clone only available on agency+
+	accountID, _ := middleware.GetAccountID(c)
+	var accountPlan string
+	_ = h.db.QueryRow(c.Context(), `SELECT plan FROM accounts WHERE id = $1`, accountID).Scan(&accountPlan)
+	lim := plans.Get(accountPlan)
+	if !lim.CloneEnabled {
+		return c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
+			"error": fmt.Sprintf("clonagem de páginas não disponível no plano %s — faça upgrade para Agency", accountPlan),
+			"plan":  accountPlan,
+		})
+	}
+
 	var req cloneRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{

@@ -41,6 +41,8 @@ type Claims struct {
 	AccountID uuid.UUID `json:"sub"`
 	Email     string    `json:"email"`
 	Name      string    `json:"name"`
+	IsAdmin   bool      `json:"is_admin"`
+	IsManager bool      `json:"is_manager"`
 	jwt.RegisteredClaims
 }
 
@@ -95,14 +97,24 @@ func (s *Service) Register(ctx context.Context, name, email, password string) (*
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
 
+	var count int
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&count)
+	isFirstUser := count == 0
+
+	// First user becomes admin and is approved immediately; all others start pending.
+	status := "pending"
+	if isFirstUser {
+		status = "approved"
+	}
+
 	accountID := uuid.New()
 	var account models.Account
 	err = s.db.QueryRow(ctx, `
-		INSERT INTO accounts (id, name, email, plan, sessions_quota, password_hash)
-		VALUES ($1, $2, $3, 'free', 10000, $4)
-		RETURNING id, name, email, plan, sessions_quota, created_at`,
-		accountID, name, email, string(hash),
-	).Scan(&account.ID, &account.Name, &account.Email, &account.Plan, &account.SessionsQuota, &account.CreatedAt)
+		INSERT INTO accounts (id, name, email, plan, sessions_quota, password_hash, is_admin, status)
+		VALUES ($1, $2, $3, 'free', 10000, $4, $5, $6)
+		RETURNING id, name, email, plan, sessions_quota, is_admin, is_manager, is_affiliate, status, email_verified, created_at`,
+		accountID, name, email, string(hash), isFirstUser, status,
+	).Scan(&account.ID, &account.Name, &account.Email, &account.Plan, &account.SessionsQuota, &account.IsAdmin, &account.IsManager, &account.IsAffiliate, &account.Status, &account.EmailVerified, &account.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("create account: %w", err)
 	}
@@ -143,11 +155,11 @@ type LoginResult struct {
 func (s *Service) Login(ctx context.Context, email, password string) (*LoginResult, error) {
 	var account models.Account
 	err := s.db.QueryRow(ctx, `
-		SELECT id, name, email, plan, sessions_quota, password_hash, created_at
+		SELECT id, name, email, plan, sessions_quota, password_hash, is_admin, is_manager, is_affiliate, status, email_verified, created_at
 		FROM accounts WHERE lower(email) = lower($1)`, email,
 	).Scan(
 		&account.ID, &account.Name, &account.Email, &account.Plan,
-		&account.SessionsQuota, &account.PasswordHash, &account.CreatedAt,
+		&account.SessionsQuota, &account.PasswordHash, &account.IsAdmin, &account.IsManager, &account.IsAffiliate, &account.Status, &account.EmailVerified, &account.CreatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrInvalidCreds
@@ -158,6 +170,13 @@ func (s *Service) Login(ctx context.Context, email, password string) (*LoginResu
 
 	if err := bcrypt.CompareHashAndPassword([]byte(account.PasswordHash), []byte(password)); err != nil {
 		return nil, ErrInvalidCreds
+	}
+
+	if account.Status == "suspended" {
+		return nil, errors.New("conta suspensa — entre em contato com o suporte")
+	}
+	if account.Status == "pending" {
+		return nil, errors.New("conta aguardando aprovação — você será notificado por email")
 	}
 
 	access, refresh, err := s.issueTokens(ctx, &account)
@@ -197,8 +216,8 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (accessToken
 
 	var account models.Account
 	err = s.db.QueryRow(ctx,
-		`SELECT id, name, email, plan, sessions_quota, created_at FROM accounts WHERE id = $1`, accountID,
-	).Scan(&account.ID, &account.Name, &account.Email, &account.Plan, &account.SessionsQuota, &account.CreatedAt)
+		`SELECT id, name, email, plan, sessions_quota, is_admin, is_manager, is_affiliate, status, email_verified, created_at FROM accounts WHERE id = $1`, accountID,
+	).Scan(&account.ID, &account.Name, &account.Email, &account.Plan, &account.SessionsQuota, &account.IsAdmin, &account.IsManager, &account.IsAffiliate, &account.Status, &account.EmailVerified, &account.CreatedAt)
 	if err != nil {
 		return "", "", fmt.Errorf("load account: %w", err)
 	}
@@ -272,6 +291,18 @@ func (s *Service) ListProjects(ctx context.Context, accountID uuid.UUID) ([]mode
 		list = append(list, p)
 	}
 	return list, nil
+}
+
+func (s *Service) GetAccount(ctx context.Context, accountID uuid.UUID) (*models.Account, error) {
+	var a models.Account
+	err := s.db.QueryRow(ctx,
+		`SELECT id, name, email, plan, sessions_quota, is_admin, is_manager, is_affiliate, status, email_verified, created_at
+		 FROM accounts WHERE id = $1`, accountID,
+	).Scan(&a.ID, &a.Name, &a.Email, &a.Plan, &a.SessionsQuota, &a.IsAdmin, &a.IsManager, &a.IsAffiliate, &a.Status, &a.EmailVerified, &a.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
 }
 
 func (s *Service) CreateProject(ctx context.Context, accountID uuid.UUID, name, domain string) (*models.Project, error) {
@@ -360,6 +391,8 @@ func (s *Service) issueTokens(ctx context.Context, account *models.Account) (acc
 		AccountID: account.ID,
 		Email:     account.Email,
 		Name:      account.Name,
+		IsAdmin:   account.IsAdmin,
+		IsManager: account.IsManager,
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(accessTokenTTL)),

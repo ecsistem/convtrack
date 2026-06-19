@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ecsistem/convtrack/internal/api/middleware"
+	"github.com/ecsistem/convtrack/internal/plans"
 	"github.com/ecsistem/convtrack/internal/shield"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -371,6 +372,24 @@ func (h *ShieldHandler) CreateCampaign(c *fiber.Ctx) error {
 	if p == nil {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
+
+	// Plan limit check
+	accountID, _ := middleware.GetAccountID(c)
+	lim, plan := h.accountLimits(c, accountID)
+	if lim.MaxCampaigns >= 0 {
+		var count int
+		_ = h.db.QueryRow(c.Context(),
+			`SELECT COUNT(*) FROM shield_campaigns WHERE project_id = $1`, p.ID,
+		).Scan(&count)
+		if count >= lim.MaxCampaigns {
+			return c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
+				"error": fmt.Sprintf("limite de %d campanhas atingido no plano %s — faça upgrade", lim.MaxCampaigns, plan),
+				"limit": lim.MaxCampaigns,
+				"plan":  plan,
+			})
+		}
+	}
+
 	var cam shield.Campaign
 	if err := c.BodyParser(&cam); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
@@ -451,6 +470,33 @@ func (h *ShieldHandler) CreateDomain(c *fiber.Ctx) error {
 	if p == nil {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
+
+	// Plan limit check
+	accountID, _ := middleware.GetAccountID(c)
+	lim, plan := h.accountLimits(c, accountID)
+	if lim.MaxDomains == 0 {
+		return c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
+			"error": fmt.Sprintf("domínios personalizados não disponíveis no plano %s — faça upgrade", plan),
+			"plan":  plan,
+		})
+	}
+	if lim.MaxDomains > 0 {
+		var count int
+		_ = h.db.QueryRow(c.Context(),
+			`SELECT COUNT(*) FROM shield_domains sd
+			 JOIN shield_campaigns sc ON sc.id = sd.campaign_id
+			 JOIN projects pr ON pr.id = sc.project_id
+			 WHERE pr.account_id = $1`, accountID,
+		).Scan(&count)
+		if count >= lim.MaxDomains {
+			return c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
+				"error": fmt.Sprintf("limite de %d domínio(s) atingido no plano %s — faça upgrade", lim.MaxDomains, plan),
+				"limit": lim.MaxDomains,
+				"plan":  plan,
+			})
+		}
+	}
+
 	var d shield.Domain
 	if err := c.BodyParser(&d); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
@@ -981,4 +1027,16 @@ func (h *ShieldHandler) GeoStats(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.JSON(fiber.Map{"data": locations})
+}
+
+// accountLimits loads the account plan and returns its limits.
+func (h *ShieldHandler) accountLimits(c *fiber.Ctx, accountID uuid.UUID) (plans.Limits, string) {
+	var plan string
+	_ = h.db.QueryRow(c.Context(),
+		`SELECT plan FROM accounts WHERE id = $1`, accountID,
+	).Scan(&plan)
+	if plan == "" {
+		plan = "free"
+	}
+	return plans.Get(plan), plan
 }

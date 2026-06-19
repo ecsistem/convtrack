@@ -13,16 +13,18 @@ import (
 	"github.com/ecsistem/convtrack/internal/shield"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
 type ShieldHandler struct {
 	svc *shield.Service
 	rdb *redis.Client
+	db  *pgxpool.Pool
 }
 
-func NewShield(svc *shield.Service, rdb *redis.Client) *ShieldHandler {
-	return &ShieldHandler{svc: svc, rdb: rdb}
+func NewShield(svc *shield.Service, rdb *redis.Client, db *pgxpool.Pool) *ShieldHandler {
+	return &ShieldHandler{svc: svc, rdb: rdb, db: db}
 }
 
 // ── Dashboard endpoints (JWT) ─────────────────────────────────────────────

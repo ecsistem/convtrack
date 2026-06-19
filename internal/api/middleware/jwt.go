@@ -34,6 +34,18 @@ func JWTAuth(authSvc *auth.Service, db *pgxpool.Pool) fiber.Handler {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid or expired token"})
 		}
 
+		// Check account status directly in DB so suspensions take effect immediately.
+		var status string
+		_ = db.QueryRow(c.Context(),
+			`SELECT status FROM accounts WHERE id = $1`, claims.AccountID,
+		).Scan(&status)
+		if status == "suspended" {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "conta suspensa — entre em contato com o suporte"})
+		}
+		if status == "pending" {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "conta aguardando aprovação"})
+		}
+
 		c.Locals("account_id", claims.AccountID)
 		c.Locals("account_email", claims.Email)
 		c.Locals("account_name", claims.Name)
