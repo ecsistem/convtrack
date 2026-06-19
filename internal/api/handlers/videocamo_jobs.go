@@ -196,9 +196,17 @@ func (h *VideoCamoJobsHandler) Enqueue(c *fiber.Ctx) error {
 	jobs := make([]videojobs.Job, 0, count)
 	for i := 0; i < count; i++ {
 		req := base
-		req.Seed = rand.Uint64() // perturbação única por variação → hash diferente
+		req.Seed = rand.Uint64() // semente única → padrão de perturbação completamente diferente
 		if count > 1 {
-			req.Saturation = jitterSaturation(base.Saturation, i) // leve variação de cor
+			req.Saturation     = jitterSaturation(base.Saturation, i)
+			req.FilterStrength = jitterFilterStrength(base.FilterStrength, i)
+			if base.Technique == shield.TechMeshOverlay {
+				// Grade: mantém técnica, varia a opacidade entre variações
+				req.Opacity = jitterOpacity(base.Opacity, i)
+			} else {
+				req.Epsilon    = jitterEpsilon(base.Epsilon, i)
+				req.Technique  = jitterTechnique(base.Technique, preset, i)
+			}
 		}
 		name := vfh.Filename
 		if count > 1 {
@@ -213,18 +221,13 @@ func (h *VideoCamoJobsHandler) Enqueue(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"data": jobs})
 }
 
-// jitterSaturation aplica uma leve variação determinística de saturação por índice
-// de variação, mantendo dentro de 0.5–1.5.
+// jitterSaturation varia saturação ±12 % por variação (antes eram ±3 %).
 func jitterSaturation(base float64, i int) float64 {
 	if base <= 0 {
 		base = 1.0
 	}
-	// deslocamento em passos de ~3% alternando sinal: -3%, +3%, -6%, +6%, …
-	step := 0.03 * float64((i+2)/2)
-	if i%2 == 1 {
-		step = -step
-	}
-	v := base + step
+	deltas := []float64{0, 0.12, -0.12, 0.20, -0.20, 0.08, -0.08, 0.16, -0.16, 0.06}
+	v := base + deltas[i%len(deltas)]
 	if v < 0.5 {
 		v = 0.5
 	}
@@ -232,6 +235,67 @@ func jitterSaturation(base float64, i int) float64 {
 		v = 1.5
 	}
 	return v
+}
+
+// jitterEpsilon varia a intensidade adversarial ±3 por variação, mantendo 1–15.
+func jitterEpsilon(base, i int) int {
+	deltas := []int{0, 3, -3, 5, -5, 2, -2, 4, -4, 6}
+	v := base + deltas[i%len(deltas)]
+	if v < 1 {
+		v = 1
+	}
+	if v > 15 {
+		v = 15
+	}
+	return v
+}
+
+// jitterFilterStrength varia a intensidade do filtro de desmarcação ±20 por variação.
+func jitterFilterStrength(base, i int) int {
+	deltas := []int{0, 15, -15, 25, -25, 10, -10, 20, -20, 5}
+	v := base + deltas[i%len(deltas)]
+	if v < 0 {
+		v = 0
+	}
+	if v > 100 {
+		v = 100
+	}
+	return v
+}
+
+// jitterOpacity varia a opacidade da grade (mesh_overlay) entre variações (0.01–0.20).
+// base vem em fração 0–1 (ex: 0.02 = 2%).
+func jitterOpacity(base float64, i int) float64 {
+	deltas := []float64{0, 0.03, -0.01, 0.06, -0.015, 0.09, 0.01, 0.12, -0.005, 0.05}
+	v := base + deltas[i%len(deltas)]
+	if v < 0.005 {
+		v = 0.005
+	}
+	if v > 0.20 {
+		v = 0.20
+	}
+	return v
+}
+
+// jitterTechnique rotaciona técnica entre variações para máxima divergência de assinatura.
+// No preset "custom" respeita a técnica escolhida pelo usuário.
+func jitterTechnique(base shield.CamoTechnique, preset string, i int) shield.CamoTechnique {
+	if preset == "custom" || base == shield.TechCoverBlend {
+		return base // não troca se o usuário escolheu manualmente ou usa cover
+	}
+	rotation := []shield.CamoTechnique{
+		shield.TechHybrid,
+		shield.TechSpectral,
+		shield.TechCheckerboard,
+		shield.TechHybrid,
+		shield.TechRandomNoise,
+		shield.TechHybrid,
+		shield.TechSpectral,
+		shield.TechHybrid,
+		shield.TechCheckerboard,
+		shield.TechRandomNoise,
+	}
+	return rotation[i%len(rotation)]
 }
 
 // List godoc — GET /v1/dashboard/shield/videocamo/jobs

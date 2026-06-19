@@ -9,9 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // ── Tipos públicos ────────────────────────────────────────────────────────────
@@ -216,58 +219,115 @@ func CamouflageVideo(req CamoVideoRequest) (*CamoVideoResult, error) {
 		// Se decodificação falhar, segue sem capa (ignora silenciosamente)
 	}
 
-	// ── Processa cada frame ───────────────────────────────────────────────────
+	// ── Processa frames em paralelo com pool de goroutines ───────────────────
 	camoDir := filepath.Join(tmpDir, "camo")
 	if err := os.MkdirAll(camoDir, 0755); err != nil {
 		return nil, err
 	}
 
-	rng := &xorshift{state: req.Seed | 1} // seed != 0
+	// Pré-gera seeds de forma determinística (xorshift é serial, não thread-safe)
+	rng := &xorshift{state: req.Seed | 1}
+	seeds := make([]uint64, len(frames))
+	for i := range seeds {
+		seeds[i] = rng.next()
+	}
 
+	// Resultado por frame (pré-alocado, acesso por índice → sem lock)
+	type frameResult struct {
+		maxDelta  int
+		meanDelta float64
+		psnr      float64
+		err       error
+	}
+	results := make([]frameResult, len(frames))
+
+	// Pool de goroutines: usa todos os CPUs disponíveis
+	numWorkers := runtime.NumCPU()
+	if numWorkers < 2 {
+		numWorkers = 2
+	}
+
+	type frameTask struct {
+		idx  int
+		path string
+	}
+	taskCh := make(chan frameTask, len(frames))
+	for i, p := range frames {
+		taskCh <- frameTask{idx: i, path: p}
+	}
+	close(taskCh)
+
+	var wg sync.WaitGroup
+	var doneCount atomic.Int64
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for t := range taskCh {
+				frameData, readErr := os.ReadFile(t.path)
+				if readErr != nil {
+					results[t.idx].err = fmt.Errorf("ler frame %d: %w", t.idx, readErr)
+					doneCount.Add(1)
+					continue
+				}
+
+				tech := req.Technique
+				var cover []byte
+				if len(coverPNG) > 0 {
+					tech = TechCoverBlend
+					cover = coverPNG
+				}
+
+				camo, camoErr := CamouflageImage(CamoRequest{
+					ImageData:  frameData,
+					MimeType:   "image/png",
+					Technique:  tech,
+					Epsilon:    req.Epsilon,
+					Seed:       seeds[t.idx],
+					CoverImage: cover,
+					BlurRadius: req.BlurRadius,
+					Opacity:    req.Opacity,
+				})
+				if camoErr != nil {
+					results[t.idx].err = fmt.Errorf("processar frame %d: %w", t.idx, camoErr)
+					doneCount.Add(1)
+					continue
+				}
+
+				outPath := filepath.Join(camoDir, fmt.Sprintf("frame_%05d.png", t.idx+1))
+				if writeErr := os.WriteFile(outPath, camo.ImageData, 0644); writeErr != nil {
+					results[t.idx].err = writeErr
+					doneCount.Add(1)
+					continue
+				}
+
+				results[t.idx] = frameResult{
+					maxDelta:  camo.MaxDelta,
+					meanDelta: camo.MeanDelta,
+					psnr:      camo.PSNR,
+				}
+
+				n := int(doneCount.Add(1))
+				if req.Progress != nil {
+					req.Progress(n, len(frames))
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Verifica erros e agrega métricas
 	var totalMax int
-	var totalMean float64
-	var totalPSNR float64
-
-	for i, framePath := range frames {
-		frameData, readErr := os.ReadFile(framePath)
-		if readErr != nil {
-			return nil, fmt.Errorf("ler frame %d: %w", i, readErr)
+	var totalMean, totalPSNR float64
+	for i, r := range results {
+		if r.err != nil {
+			return nil, r.err
 		}
-
-		tech := req.Technique
-		var cover []byte
-		if len(coverPNG) > 0 {
-			tech = TechCoverBlend
-			cover = coverPNG
-		}
-
-		camo, camoErr := CamouflageImage(CamoRequest{
-			ImageData:  frameData,
-			MimeType:   "image/png",
-			Technique:  tech,
-			Epsilon:    req.Epsilon,
-			Seed:       rng.next(),
-			CoverImage: cover,
-			BlurRadius: req.BlurRadius,
-			Opacity:    req.Opacity,
-		})
-		if camoErr != nil {
-			return nil, fmt.Errorf("processar frame %d: %w", i, camoErr)
-		}
-
-		outPath := filepath.Join(camoDir, fmt.Sprintf("frame_%05d.png", i+1))
-		if writeErr := os.WriteFile(outPath, camo.ImageData, 0644); writeErr != nil {
-			return nil, writeErr
-		}
-
-		totalMax += camo.MaxDelta
-		totalMean += camo.MeanDelta
-		totalPSNR += camo.PSNR
-
-		// Progresso (a etapa frame-a-frame é a mais cara): reporta a cada frame.
-		if req.Progress != nil {
-			req.Progress(i+1, len(frames))
-		}
+		totalMax += r.maxDelta
+		totalMean += r.meanDelta
+		totalPSNR += r.psnr
+		_ = i
 	}
 
 	n := len(frames)

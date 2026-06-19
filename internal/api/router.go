@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 
 	"github.com/ecsistem/convtrack/internal/analytics"
 	"github.com/ecsistem/convtrack/internal/api/handlers"
@@ -85,9 +86,15 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	billingSvc := billing.New(db)
 	billingH   := handlers.NewBilling(billingSvc)
 
-	// Fila assíncrona de camuflagem de vídeo (workers em background)
+	// Fila assíncrona de camuflagem de vídeo (workers em background).
+	// Cada worker usa runtime.NumCPU() goroutines para processar frames em paralelo,
+	// então 2 workers de fila já satura completamente os CPUs disponíveis.
+	videoQueueWorkers := runtime.NumCPU() / 4
+	if videoQueueWorkers < 2 {
+		videoQueueWorkers = 2
+	}
 	var videoJobsH *handlers.VideoCamoJobsHandler
-	if vq, qErr := videojobs.New(os.Getenv("VIDEOCAMO_DIR"), 2); qErr != nil {
+	if vq, qErr := videojobs.New(os.Getenv("VIDEOCAMO_DIR"), videoQueueWorkers); qErr != nil {
 		fmt.Printf("warn: fila de videocamo desativada: %v\n", qErr)
 	} else {
 		videoJobsH = handlers.NewVideoCamoJobs(vq)
