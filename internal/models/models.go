@@ -214,6 +214,7 @@ type ShieldLog struct {
 	Reason     string `json:"reason"      db:"reason"`
 	Action     string `json:"action"      db:"action"`
 	RedirectTo string `json:"redirect_to" db:"redirect_to"`
+	RawURL     string `json:"raw_url"     db:"raw_url"`
 	CreatedAt  string `json:"created_at"  db:"created_at"`
 }
 

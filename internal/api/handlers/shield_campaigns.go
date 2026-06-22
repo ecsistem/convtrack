@@ -35,27 +35,29 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 
 	ip := middleware.ClientIP(c)
 	ua := c.Get("User-Agent")
+	// URL completa da tentativa de acesso (path + query string completos)
+	rawURL := string(c.Request().URI().PathOriginal()) + "?" + string(c.Request().URI().QueryString())
 
-	// ── 0. Em análise — safe_url para todos sem logar como bot ─────────────
-	if campaign.UnderReview {
+	safeRedirect := func(reason string) error {
 		safeURL := campaign.SafeURL
 		if safeURL == "" {
 			safeURL = "https://google.com"
 		}
+		h.svc.LogFiltered(campaign.ProjectID, ip, ua, reason, safeURL, rawURL)
 		return c.Redirect(safeURL, fiber.StatusFound)
+	}
+
+	// ── 0. Em análise — safe_url para todos ────────────────────────────────
+	if campaign.UnderReview {
+		return safeRedirect("under_review")
 	}
 
 	// ── 0b. Click ID obrigatório (revisor de anúncio abre sem o click pago) ──
-	// require_ttclid (legado, TikTok) OU require_clickid (genérico por plataforma).
 	if campaign.RequireTtclid && c.Query("ttclid") == "" {
-		safeURL := campaign.SafeURL
-		if safeURL == "" {
-			safeURL = "https://google.com"
-		}
-		return c.Redirect(safeURL, fiber.StatusFound)
+		return safeRedirect("no_ttclid")
 	}
 	if campaign.RequireClickID {
-		params := campaign.ClickIDParams() // um por plataforma selecionada
+		params := campaign.ClickIDParams()
 		if len(params) > 0 {
 			hasClickID := false
 			for _, param := range params {
@@ -65,38 +67,22 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 				}
 			}
 			if !hasClickID {
-				safeURL := campaign.SafeURL
-				if safeURL == "" {
-					safeURL = "https://google.com"
-				}
-				return c.Redirect(safeURL, fiber.StatusFound)
+				return safeRedirect("no_click_id")
 			}
 		}
 	}
 
-	// ── 0d. Origem real (ignora utm_source, valida o Referer) ──────────────
-	// Quando origin_only está ativo, o clique precisa vir de fato de uma das
-	// plataformas da campanha (pelo Referer). utm_source é ignorado por ser
-	// forjável.
+	// ── 0d. Origem real (valida o Referer HTTP) ────────────────────────────
 	if campaign.OriginOnly {
 		if !campaign.OriginMatches(c.Get("Referer")) {
-			safeURL := campaign.SafeURL
-			if safeURL == "" {
-				safeURL = "https://google.com"
-			}
-			return c.Redirect(safeURL, fiber.StatusFound)
+			return safeRedirect("origin_blocked")
 		}
 	}
 
 	// ── 1. Chave de acesso secreta ──────────────────────────────────────────
 	if campaign.RequireKey && campaign.AccessKey != "" {
 		if c.Query("_sk") != campaign.AccessKey {
-			// Sem a chave → safe_url silenciosamente
-			safeURL := campaign.SafeURL
-			if safeURL == "" {
-				safeURL = "https://google.com"
-			}
-			return c.Redirect(safeURL, fiber.StatusFound)
+			return safeRedirect("invalid_key")
 		}
 	}
 
@@ -106,6 +92,7 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 		UserAgent: ua,
 		Referer:   c.Get("Referer"),
 		UTMSource: c.Query("utm_source"),
+		RawURL:    rawURL,
 	})
 
 	isBot := result != nil && !result.Allowed

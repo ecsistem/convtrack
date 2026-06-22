@@ -161,9 +161,9 @@ func (s *Service) ListLogs(ctx context.Context, projectID uuid.UUID, limit, offs
 // insertLog persiste o log e publica no Redis para o SSE.
 func (s *Service) insertLog(ctx context.Context, l *models.ShieldLog, projectID uuid.UUID) {
 	_, err := s.db.Exec(ctx, `
-		INSERT INTO shield_logs (project_id, ip, user_agent, country, device, reason, action, redirect_to)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-		projectID, l.IP, l.UserAgent, l.Country, l.Device, l.Reason, l.Action, l.RedirectTo,
+		INSERT INTO shield_logs (project_id, ip, user_agent, country, device, reason, action, redirect_to, raw_url)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		projectID, l.IP, l.UserAgent, l.Country, l.Device, l.Reason, l.Action, l.RedirectTo, l.RawURL,
 	)
 	if err != nil {
 		return
@@ -190,6 +190,8 @@ type CheckRequest struct {
 	// Fontes de tráfego
 	Referer   string // cabeçalho HTTP Referer
 	UTMSource string // parâmetro ?utm_source=
+	// URL completa da tentativa (path + query string), ex: /patine?utm_source=KW-...
+	RawURL string
 }
 
 // detectSource identifica a plataforma de origem a partir do Referer e utm_source.
@@ -205,7 +207,7 @@ func detectSource(referer, utmSource string) string {
 		return "meta"
 	case strings.Contains(utm, "tiktok") || utm == "ttk":
 		return "tiktok"
-	case strings.Contains(utm, "kwai"):
+	case strings.Contains(utm, "kwai") || strings.HasPrefix(utm, "kw-"):
 		return "kwai"
 	case strings.Contains(utm, "google") || strings.Contains(utm, "adwords") || strings.Contains(utm, "gads"):
 		return "google"
@@ -381,6 +383,7 @@ func (s *Service) Check(ctx context.Context, projectID uuid.UUID, req CheckReque
 			Device:    device,
 			Reason:    "human",
 			Action:    "allowed",
+			RawURL:    req.RawURL,
 		}, projectID)
 		// Dispara evento "visit" para webhooks que assinam este evento
 		go s.FireWebhooks(context.Background(), projectID, EventVisit, map[string]interface{}{
@@ -411,6 +414,7 @@ func (s *Service) block(ctx context.Context, projectID uuid.UUID, cfg *models.Sh
 		Reason:     reason,
 		Action:     action,
 		RedirectTo: redirectURL,
+		RawURL:     req.RawURL,
 	}
 	go s.insertLog(context.Background(), log, projectID)
 	go s.insertVisit(context.Background(), projectID, VisitRecord{
@@ -536,6 +540,36 @@ func (s *Service) lookupIP(ctx context.Context, ip string) ipAPIResult {
 	}
 
 	return result
+}
+
+// LogFiltered registra no log e em shield_visits uma visita filtrada antes do Check().
+// Usado por handlers que bloqueiam antes de chamar Check (ex: OriginOnly, RequireKey).
+func (s *Service) LogFiltered(projectID uuid.UUID, ip, ua, reason, redirectTo, rawURL string) {
+	device := deviceFromUA(ua)
+	action := "blocked"
+	if redirectTo != "" {
+		action = "redirected"
+	}
+	l := &models.ShieldLog{
+		IP:         ip,
+		UserAgent:  ua,
+		Device:     device,
+		Reason:     reason,
+		Action:     action,
+		RedirectTo: redirectTo,
+		RawURL:     rawURL,
+	}
+	go s.insertLog(context.Background(), l, projectID)
+	go s.insertVisit(context.Background(), projectID, VisitRecord{
+		IP:        ip,
+		UserAgent: ua,
+		Device:    device,
+		IsBot:     true,
+		BotScore:  0.9,
+		Signals:   []string{reason},
+		Action:    action,
+		DestURL:   redirectTo,
+	})
 }
 
 // ClearLogs apaga todos os logs de shield do projeto.

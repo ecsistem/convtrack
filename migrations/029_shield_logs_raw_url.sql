@@ -1,0 +1,3 @@
+-- Adiciona URL completa da tentativa de acesso no log do shield.
+-- Exemplo: /patine?_sk=xxx&utm_source=KW-...&click_id=...
+ALTER TABLE shield_logs ADD COLUMN IF NOT EXISTS raw_url TEXT NOT NULL DEFAULT '';

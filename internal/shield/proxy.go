@@ -108,10 +108,13 @@ func (s *Service) proxyRequest(c *fiber.Ctx, targetURL string, campaign *Campaig
 		return c.Status(fiber.StatusBadGateway).SendString("proxy: request build error")
 	}
 
-	// Repassa headers do cliente (exceto Host e Connection)
+	// Repassa headers do cliente (exceto Host, Connection e Accept-Encoding).
+	// Accept-Encoding é removido para que o upstream responda sem compressão —
+	// o proxy descomprime apenas HTML (readBody); respostas binárias/CSS/JS
+	// viriam crus se viessem gzip sem serem descomprimidas antes de reenviar.
 	c.Request().Header.VisitAll(func(k, v []byte) {
 		key := string(k)
-		if key == "Host" || key == "Connection" || key == "Transfer-Encoding" {
+		if key == "Host" || key == "Connection" || key == "Transfer-Encoding" || key == "Accept-Encoding" {
 			return
 		}
 		req.Header.Set(key, string(v))
