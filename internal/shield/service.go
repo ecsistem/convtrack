@@ -133,7 +133,7 @@ func (s *Service) ListLogs(ctx context.Context, projectID uuid.UUID, limit, offs
 
 	rows, err := s.db.Query(ctx, `
 		SELECT id::text, project_id::text, ip, user_agent, country, device,
-		       reason, action, redirect_to, created_at::text
+		       reason, action, redirect_to, raw_url, created_at::text
 		FROM shield_logs
 		WHERE project_id = $1
 		ORDER BY created_at DESC
@@ -147,7 +147,7 @@ func (s *Service) ListLogs(ctx context.Context, projectID uuid.UUID, limit, offs
 	for rows.Next() {
 		var l models.ShieldLog
 		if err := rows.Scan(&l.ID, &l.ProjectID, &l.IP, &l.UserAgent, &l.Country,
-			&l.Device, &l.Reason, &l.Action, &l.RedirectTo, &l.CreatedAt); err != nil {
+			&l.Device, &l.Reason, &l.Action, &l.RedirectTo, &l.RawURL, &l.CreatedAt); err != nil {
 			continue
 		}
 		logs = append(logs, l)
