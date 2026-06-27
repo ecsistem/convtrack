@@ -31,6 +31,43 @@ func realClientIP(c *fiber.Ctx) string {
 	return c.IP()
 }
 
+// staticAssetExt — extensões de sub-recurso de página (CSS, JS, imagens,
+// fontes, mídia). Requisições para esses arquivos não são "visitas" — são
+// disparadas automaticamente pelo navegador ao renderizar a página que já
+// foi liberada na requisição de navegação. Não devem gerar log nem rodar
+// Check() de novo (evita logs duplicados/poluídos e decisões inconsistentes
+// de money/safe entre o HTML e seus próprios assets).
+var staticAssetExt = []string{
+	".css", ".js", ".mjs", ".map",
+	".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".avif",
+	".woff", ".woff2", ".ttf", ".eot", ".otf",
+	".mp4", ".webm", ".mp3", ".wav",
+	".json", ".xml", ".txt", ".pdf",
+}
+
+// isStaticAsset verifica se o path da requisição é um sub-recurso estático
+// (pela extensão), não a navegação principal da página.
+func isStaticAsset(path string) bool {
+	lower := strings.ToLower(path)
+	for _, ext := range staticAssetExt {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+// domainProxyDecisionCookie nomeia o cookie que guarda a decisão (money/safe)
+// tomada na requisição de navegação, para os assets da mesma página reusarem
+// sem rodar Check()/log de novo.
+func domainProxyDecisionCookie(campaignID string) string {
+	id := campaignID
+	if len(id) > 8 {
+		id = id[:8]
+	}
+	return "ct_dpx_" + id
+}
+
 // DomainProxyMiddleware é um middleware Fiber que intercepta requisições para domínios
 // registrados em shield_domains e as roteia como proxy reverso.
 // Para domínios não registrados, chama c.Next() sem interferir.
@@ -46,10 +83,30 @@ func (s *Service) DomainProxyMiddleware(c *fiber.Ctx) error {
 		return c.Next() // não é um domínio do Shield — deixa passar
 	}
 
+	path := string(c.Request().URI().Path())
+	cookieName := domainProxyDecisionCookie(campaign.ID.String())
+
+	// ── Sub-recurso (CSS/JS/imagem/fonte) ───────────────────────────────
+	// Reusa a decisão da navegação principal — sem Check(), sem log.
+	if isStaticAsset(path) {
+		if cached := c.Cookies(cookieName); cached != "" {
+			return s.proxyRequest(c, cached, campaign)
+		}
+		// Sem cookie (hotlink direto ao asset) — resolve sem registrar log.
+		targetURL, _ := ChooseURL(campaign, realClientIP(c))
+		if targetURL == "" {
+			targetURL = campaign.SafeURL
+		}
+		if targetURL == "" {
+			return c.Status(fiber.StatusNotFound).SendString("campaign URL not configured")
+		}
+		return s.proxyRequest(c, targetURL, campaign)
+	}
+
 	ip := realClientIP(c)
 	ua := c.Get("User-Agent")
 
-	// ── Verificação rápida server-side ────────────────────────────────
+	// ── Navegação principal — Verificação server-side + log ────────────
 	result, _ := s.Check(c.Context(), campaign.ProjectID, CheckRequest{
 		IP:        ip,
 		UserAgent: ua,
@@ -69,6 +126,15 @@ func (s *Service) DomainProxyMiddleware(c *fiber.Ctx) error {
 	if targetURL == "" {
 		return c.Status(fiber.StatusNotFound).SendString("campaign URL not configured")
 	}
+
+	// Guarda a decisão para os assets desta mesma página reusarem.
+	c.Cookie(&fiber.Cookie{
+		Name:     cookieName,
+		Value:    targetURL,
+		MaxAge:   600, // 10min — cobre o tempo de carregar a página
+		HTTPOnly: true,
+		SameSite: "Lax",
+	})
 
 	return s.proxyRequest(c, targetURL, campaign)
 }

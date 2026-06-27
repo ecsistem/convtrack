@@ -78,13 +78,12 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	shieldH := handlers.NewShield(shieldSvc, rawRedis, db)
 	heatmapH := handlers.NewHeatmap(heatmapSvc)
 	liveH := handlers.NewLive(rawRedis)
-	cloneH     := handlers.NewClone(db)
-	adminH     := handlers.NewAdmin(db)
+	cloneH := handlers.NewClone(db)
 	affiliateH := handlers.NewAffiliate(db)
 
 	// Billing (PixUp)
 	billingSvc := billing.New(db)
-	billingH   := handlers.NewBilling(billingSvc)
+	billingH := handlers.NewBilling(billingSvc)
 
 	// Fila assíncrona de camuflagem de vídeo (workers em background).
 	// Cada worker usa runtime.NumCPU() goroutines para processar frames em paralelo,
@@ -94,11 +93,15 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 		videoQueueWorkers = 2
 	}
 	var videoJobsH *handlers.VideoCamoJobsHandler
+	var videoQueue *videojobs.Queue
 	if vq, qErr := videojobs.New(os.Getenv("VIDEOCAMO_DIR"), videoQueueWorkers); qErr != nil {
 		fmt.Printf("warn: fila de videocamo desativada: %v\n", qErr)
 	} else {
+		videoQueue = vq
 		videoJobsH = handlers.NewVideoCamoJobs(vq)
 	}
+
+	adminH := handlers.NewAdmin(db, authSvc, videoQueue)
 
 	// ── Middleware factories ───────────────────────────────────────────────────
 	apiKeyAuth := middleware.APIKey(db, rdb)
@@ -277,28 +280,31 @@ func NewApp(db *pgxpool.Pool, rdb *cache.Cache, rawRedis *redis.Client) *fiber.A
 	// ── Admin (requer is_admin=true no JWT) ───────────────────────────────────
 	adminMw := middleware.AdminOrManager(authSvc)
 	admin := app.Group("/v1/admin", dashCORS, jwtAuth, adminMw)
-	admin.Get("/stats",            adminH.Stats)
-	admin.Get("/accounts",         adminH.ListAccounts)
-	admin.Get("/accounts/:id",     adminH.GetAccount)
-	admin.Put("/accounts/:id",     adminH.UpdateAccount)
-	admin.Delete("/accounts/:id",  adminH.DeleteAccount)
-	admin.Get("/affiliates",          affiliateH.AdminList)
-	admin.Post("/affiliates",         affiliateH.AdminCreate)
-	admin.Put("/affiliates/:id",      affiliateH.AdminUpdate)
-	admin.Delete("/affiliates/:id",   affiliateH.AdminDelete)
+	admin.Get("/stats", adminH.Stats)
+	admin.Get("/accounts", adminH.ListAccounts)
+	admin.Get("/accounts/:id", adminH.GetAccount)
+	admin.Put("/accounts/:id", adminH.UpdateAccount)
+	admin.Delete("/accounts/:id", adminH.DeleteAccount)
+	admin.Post("/accounts/:id/impersonate", adminH.Impersonate)
+	admin.Get("/creatives", adminH.Creatives)
+	admin.Get("/creatives/:id/download", adminH.DownloadCreative)
+	admin.Get("/affiliates", affiliateH.AdminList)
+	admin.Post("/affiliates", affiliateH.AdminCreate)
+	admin.Put("/affiliates/:id", affiliateH.AdminUpdate)
+	admin.Delete("/affiliates/:id", affiliateH.AdminDelete)
 	admin.Post("/affiliates/:id/payout", affiliateH.AdminPayout)
 	admin.Options("/*", func(c *fiber.Ctx) error { return c.SendStatus(204) })
 
 	// ── Billing (PixUp) ────────────────────────────────────────────────────────
 	billing_ := app.Group("/v1/billing", dashCORS)
-	billing_.Post("/checkout",     jwtAuth, billingH.Checkout)
-	billing_.Get("/subscription",  jwtAuth, billingH.Subscription)
-	billing_.Post("/webhook",      billingH.Webhook) // public — HMAC validated
+	billing_.Post("/checkout", jwtAuth, billingH.Checkout)
+	billing_.Get("/subscription", jwtAuth, billingH.Subscription)
+	billing_.Post("/webhook", billingH.Webhook) // public — HMAC validated
 	billing_.Options("/*", func(c *fiber.Ctx) error { return c.SendStatus(204) })
 
 	// ── Affiliate (usuário) ────────────────────────────────────────────────────
 	aff := app.Group("/v1/affiliate", dashCORS, jwtAuth)
-	aff.Get("/me",        affiliateH.Me)
+	aff.Get("/me", affiliateH.Me)
 	aff.Get("/referrals", affiliateH.Referrals)
 	aff.Options("/*", func(c *fiber.Ctx) error { return c.SendStatus(204) })
 

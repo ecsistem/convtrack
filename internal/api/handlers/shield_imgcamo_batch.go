@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"strings"
 
+	"github.com/ecsistem/convtrack/internal/api/middleware"
 	"github.com/ecsistem/convtrack/internal/shield"
 	"github.com/gofiber/fiber/v2"
 )
@@ -139,6 +140,12 @@ func (h *ShieldHandler) BatchCamouflageImage(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 		}
 		generated++
+
+		if project := middleware.GetProject(c); project != nil {
+			variantName := fmt.Sprintf("variacao_%02d_%s", i+1, fh.Filename)
+			data := res.ImageData
+			go h.saveImgCamoLog(project.ID, variantName, string(tech), variantEps, res.MimeType, data)
+		}
 	}
 	if generated == 0 {
 		return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{"error": "falha ao gerar variações"})

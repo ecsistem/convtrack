@@ -31,6 +31,7 @@ const (
 // Job é a visão pública (serializável) de um job da fila.
 type Job struct {
 	ID        string    `json:"id"`
+	ProjectID string    `json:"project_id,omitempty"` // exposto só na listagem admin (cross-projeto)
 	Filename  string    `json:"filename"`
 	Preset    string    `json:"preset"`
 	Topic     string    `json:"topic"`
@@ -138,6 +139,24 @@ func (q *Queue) List(projectID string) []Job {
 	return out
 }
 
+// ListAll devolve todos os jobs de todos os projetos (uso exclusivo do admin),
+// do mais recente para o mais antigo, com ProjectID preenchido.
+func (q *Queue) ListAll() []Job {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var out []Job
+	for i := len(q.order) - 1; i >= 0; i-- {
+		ij := q.jobs[q.order[i]]
+		if ij == nil {
+			continue
+		}
+		job := ij.Job
+		job.ProjectID = ij.projectID
+		out = append(out, job)
+	}
+	return out
+}
+
 // Get devolve um job específico (validando o projeto).
 func (q *Queue) Get(projectID, id string) (Job, bool) {
 	q.mu.Lock()
@@ -155,6 +174,18 @@ func (q *Queue) ResultPath(projectID, id string) (string, string, bool) {
 	defer q.mu.Unlock()
 	ij := q.jobs[id]
 	if ij == nil || ij.projectID != projectID || ij.Status != StatusDone {
+		return "", "", false
+	}
+	return ij.resultPath, ij.Filename, true
+}
+
+// ResultPathAny é a versão sem checagem de projeto, para o admin baixar o
+// resultado de qualquer conta.
+func (q *Queue) ResultPathAny(id string) (string, string, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	ij := q.jobs[id]
+	if ij == nil || ij.Status != StatusDone {
 		return "", "", false
 	}
 	return ij.resultPath, ij.Filename, true

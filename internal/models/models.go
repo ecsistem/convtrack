@@ -193,6 +193,9 @@ type ShieldConfig struct {
 	GeoMode         string   `json:"geo_mode"         db:"geo_mode"`         // disabled|allowlist|blocklist
 	GeoCountries    []string `json:"geo_countries"    db:"geo_countries"`
 	DeviceFilter    string   `json:"device_filter"    db:"device_filter"`    // all|mobile|desktop
+	// OSAllowed restringe por sistema operacional. Vazio = todos permitidos.
+	// Valores: "ios"|"android"|"windows"|"macos"|"linux"
+	OSAllowed       []string `json:"os_allowed"       db:"os_allowed"`
 	RedirectURL     string   `json:"redirect_url"     db:"redirect_url"`
 	PrimaryURL      string   `json:"primary_url"      db:"primary_url"`
 	FallbackURLs    []string `json:"fallback_urls"    db:"fallback_urls"`

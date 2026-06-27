@@ -136,3 +136,26 @@ func deviceFromUA(ua string) string {
 	}
 	return "desktop"
 }
+
+// osFromUA identifica o sistema operacional a partir do User-Agent.
+// Retorna "ios", "android", "windows", "macos", "linux" ou "other".
+// Checagem de "windows phone" vem antes de "windows" pois o token "windows"
+// aparece em ambos.
+func osFromUA(ua string) string {
+	lower := strings.ToLower(ua)
+	switch {
+	case strings.Contains(lower, "iphone") || strings.Contains(lower, "ipad") ||
+		strings.Contains(lower, "ipod") || strings.Contains(lower, "cpu os") || strings.Contains(lower, "cpu iphone os"):
+		return "ios"
+	case strings.Contains(lower, "android"):
+		return "android"
+	case strings.Contains(lower, "windows"):
+		return "windows"
+	case strings.Contains(lower, "mac os x") || strings.Contains(lower, "macintosh"):
+		return "macos"
+	case strings.Contains(lower, "linux"):
+		return "linux"
+	default:
+		return "other"
+	}
+}

@@ -1,18 +1,22 @@
 package handlers
 
 import (
+	"github.com/ecsistem/convtrack/internal/auth"
 	"github.com/ecsistem/convtrack/internal/models"
+	"github.com/ecsistem/convtrack/internal/videojobs"
 	fiber "github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type AdminHandler struct {
-	db *pgxpool.Pool
+	db        *pgxpool.Pool
+	authSvc   *auth.Service
+	videoJobs *videojobs.Queue // nil se a fila de vídeo estiver desativada
 }
 
-func NewAdmin(db *pgxpool.Pool) *AdminHandler {
-	return &AdminHandler{db: db}
+func NewAdmin(db *pgxpool.Pool, authSvc *auth.Service, videoJobs *videojobs.Queue) *AdminHandler {
+	return &AdminHandler{db: db, authSvc: authSvc, videoJobs: videoJobs}
 }
 
 // AdminAccount extends Account with extra admin-only info.
@@ -25,7 +29,7 @@ type AdminAccount struct {
 func (h *AdminHandler) ListAccounts(c *fiber.Ctx) error {
 	status := c.Query("status", "")
 	search := c.Query("search", "")
-	limit  := c.QueryInt("limit", 50)
+	limit := c.QueryInt("limit", 50)
 	offset := c.QueryInt("offset", 0)
 	if limit > 200 {
 		limit = 200
@@ -132,6 +136,16 @@ func (h *AdminHandler) UpdateAccount(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "json inválido"})
 	}
 
+	// Gerentes não podem alterar NADA de uma conta de administrador —
+	// nem status, plano, quota ou qualquer outro campo. Só admins tocam em admins.
+	if !callerIsAdmin {
+		var targetIsAdmin bool
+		_ = h.db.QueryRow(c.Context(), `SELECT is_admin FROM accounts WHERE id=$1`, id).Scan(&targetIsAdmin)
+		if targetIsAdmin {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "gerentes não podem alterar contas de administrador"})
+		}
+	}
+
 	// Managers cannot touch the is_admin flag.
 	if body.IsAdmin != nil && !callerIsAdmin {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "apenas admins podem alterar o cargo de admin"})
@@ -196,6 +210,180 @@ func (h *AdminHandler) DeleteAccount(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.JSON(fiber.Map{"ok": true})
+}
+
+// Impersonate  POST /v1/admin/accounts/:id/impersonate
+// Gera um token de sessão para a conta alvo, permitindo o admin acessar o
+// painel do cliente como se tivesse logado. Somente admins — gerentes não
+// podem impersonar ninguém (acesso a dados de qualquer conta é sensível
+// demais para o escopo do cargo de gerente).
+func (h *AdminHandler) Impersonate(c *fiber.Ctx) error {
+	callerIsAdmin, _ := c.Locals("caller_is_admin").(bool)
+	if !callerIsAdmin {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "apenas admins podem acessar o painel de outra conta"})
+	}
+
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "id inválido"})
+	}
+
+	adminAccountID, _ := c.Locals("account_id").(uuid.UUID)
+
+	result, err := h.authSvc.ImpersonateAccount(c.Context(), id)
+	if err != nil {
+		return c.Status(404).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	if adminAccountID != uuid.Nil {
+		_, _ = h.db.Exec(c.Context(), `
+			INSERT INTO admin_impersonations (admin_account_id, target_account_id)
+			VALUES ($1, $2)`, adminAccountID, id)
+	}
+
+	return c.JSON(fiber.Map{
+		"account":       result.Account,
+		"access_token":  result.AccessToken,
+		"refresh_token": result.RefreshToken,
+	})
+}
+
+// Creatives  GET /v1/admin/creatives?type=image|video&page=&limit=
+// Lista criativos camuflados (imagem e/ou vídeo) de TODAS as contas, com
+// nome da conta/projeto, para o admin auditar o que foi gerado na plataforma.
+func (h *AdminHandler) Creatives(c *fiber.Ctx) error {
+	kind := c.Query("type", "")
+	limit := c.QueryInt("limit", 50)
+	offset := c.QueryInt("offset", 0)
+	if limit > 200 {
+		limit = 200
+	}
+
+	type creative struct {
+		ID          string `json:"id"`
+		Kind        string `json:"kind"` // "image" | "video"
+		Filename    string `json:"filename"`
+		Technique   string `json:"technique,omitempty"`
+		ProjectID   string `json:"project_id"`
+		ProjectName string `json:"project_name"`
+		AccountName string `json:"account_name"`
+		AccountID   string `json:"account_id"`
+		SizeBytes   int64  `json:"size_bytes"`
+		Status      string `json:"status,omitempty"`
+		CreatedAt   string `json:"created_at"`
+	}
+	var out []creative
+
+	if kind == "" || kind == "image" {
+		rows, err := h.db.Query(c.Context(), `
+			SELECT il.id, il.filename, il.technique, il.size_bytes, il.created_at,
+			       p.id, p.name, a.id, a.name
+			FROM imgcamo_log il
+			JOIN projects p ON p.id = il.project_id
+			JOIN accounts a ON a.id = p.account_id
+			ORDER BY il.created_at DESC
+			LIMIT $1 OFFSET $2`, limit, offset)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var cr creative
+				if err := rows.Scan(&cr.ID, &cr.Filename, &cr.Technique, &cr.SizeBytes, &cr.CreatedAt,
+					&cr.ProjectID, &cr.ProjectName, &cr.AccountID, &cr.AccountName); err == nil {
+					cr.Kind = "image"
+					out = append(out, cr)
+				}
+			}
+		}
+	}
+
+	if (kind == "" || kind == "video") && h.videoJobs != nil {
+		jobs := h.videoJobs.ListAll()
+		// Pagina a fila em memória do mesmo jeito que a query SQL (offset/limit).
+		// Para a visão combinada (kind=""), evita duplicar vídeos em toda página.
+		videoOffset, videoLimit := offset, limit
+		if kind == "" {
+			if offset > 0 {
+				videoOffset = len(jobs) // pula vídeos nas páginas seguintes — só aparecem na 1ª
+			} else {
+				videoLimit = limit
+			}
+		}
+		if videoOffset < len(jobs) {
+			end := videoOffset + videoLimit
+			if end > len(jobs) {
+				end = len(jobs)
+			}
+			jobs = jobs[videoOffset:end]
+		} else {
+			jobs = nil
+		}
+		if len(jobs) > 0 {
+			projectIDs := make([]string, 0, len(jobs))
+			seen := map[string]bool{}
+			for _, j := range jobs {
+				if !seen[j.ProjectID] {
+					seen[j.ProjectID] = true
+					projectIDs = append(projectIDs, j.ProjectID)
+				}
+			}
+			names := map[string][2]string{} // projectID -> [projectName, accountName+accountID combo handled below]
+			rows, err := h.db.Query(c.Context(), `
+				SELECT p.id, p.name, a.id, a.name
+				FROM projects p JOIN accounts a ON a.id = p.account_id
+				WHERE p.id = ANY($1)`, projectIDs)
+			accNames := map[string]string{}
+			accIDs := map[string]string{}
+			if err == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var pid, pname, aid, aname string
+					if rows.Scan(&pid, &pname, &aid, &aname) == nil {
+						names[pid] = [2]string{pname, aname}
+						accNames[pid] = aname
+						accIDs[pid] = aid
+					}
+				}
+			}
+			for _, j := range jobs {
+				n := names[j.ProjectID]
+				out = append(out, creative{
+					ID: j.ID, Kind: "video", Filename: j.Filename, Technique: j.Preset,
+					ProjectID: j.ProjectID, ProjectName: n[0], AccountName: n[1], AccountID: accIDs[j.ProjectID],
+					SizeBytes: j.Size, Status: string(j.Status), CreatedAt: j.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+				})
+			}
+		}
+	}
+
+	return c.JSON(fiber.Map{"data": out})
+}
+
+// DownloadCreative  GET /v1/admin/creatives/:id/download?type=image|video
+func (h *AdminHandler) DownloadCreative(c *fiber.Ctx) error {
+	kind := c.Query("type", "image")
+	id := c.Params("id")
+
+	if kind == "video" {
+		if h.videoJobs == nil {
+			return c.Status(404).JSON(fiber.Map{"error": "fila de vídeo desativada"})
+		}
+		path, filename, ok := h.videoJobs.ResultPathAny(id)
+		if !ok {
+			return c.Status(404).JSON(fiber.Map{"error": "resultado não disponível"})
+		}
+		c.Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+		return c.SendFile(path)
+	}
+
+	var storagePath, filename string
+	err := h.db.QueryRow(c.Context(),
+		`SELECT storage_path, filename FROM imgcamo_log WHERE id=$1`, id,
+	).Scan(&storagePath, &filename)
+	if err != nil || storagePath == "" {
+		return c.Status(404).JSON(fiber.Map{"error": "criativo não encontrado"})
+	}
+	c.Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	return c.SendFile(storagePath)
 }
 
 // Stats  GET /v1/admin/stats

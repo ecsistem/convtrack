@@ -2,29 +2,30 @@ package shield
 
 import (
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"math/big"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// ── CAPTCHA token (stateless, HMAC-SHA256) ───────────────────────────────────
+// ── CAPTCHA de clique (stateless, HMAC-SHA256) ───────────────────────────────
 //
-// Token format (base64url): "<answer>:<timestamp>:<hmac>"
-// Valid for 10 minutes. Secret = campaign access_key (falls back to built-in salt).
+// Não é mais um desafio matemático — o usuário só precisa clicar no botão.
+// O token prova que a página foi de fato renderizada e clicada dentro do TTL
+// (a maioria dos scrapers/bots simples não executa JS nem dispara o clique).
+//
+// Token format (base64url): "<issued_at>:<campaignID>:<hmac>"
+// Válido por 10 minutos. Secret = access_key da campanha (fallback: salt fixo).
 
 const captchaTTL = 10 * time.Minute
 const captchaFallbackSecret = "ct-shield-captcha-v1"
 
-// randInt retorna um número aleatório criptograficamente seguro no intervalo [min, max].
-func randInt(min, max int) int {
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
-	return min + int(n.Int64())
-}
+// captchaMinDelay é o tempo mínimo entre o token ser gerado e o clique chegar
+// no servidor. Cliques abaixo disso são suspeitos (replay automatizado/scraper
+// que já tinha o token pronto), não um humano de fato lendo a página.
+const captchaMinDelay = 350 * time.Millisecond
 
 // captchaSecret retorna o secret para HMAC — usa access_key se disponível.
 func captchaSecret(accessKey string) string {
@@ -34,68 +35,54 @@ func captchaSecret(accessKey string) string {
 	return captchaFallbackSecret
 }
 
-// CaptchaChallenge representa um desafio gerado.
+// CaptchaChallenge representa um desafio de clique gerado.
 type CaptchaChallenge struct {
-	Question string // texto da pergunta (ex: "Quanto é 14 + 7?")
-	Token    string // token opaco para passar no form (base64url)
+	Token string // token opaco para passar no form (base64url)
 }
 
-// GenerateCaptcha cria um desafio matemático e retorna question + token opaco.
+// GenerateCaptcha cria um desafio de clique (sem pergunta) e retorna o token opaco.
 func GenerateCaptcha(campaignID, accessKey string) CaptchaChallenge {
-	a := randInt(1, 20)
-	b := randInt(1, 20)
-	answer := a + b
-	question := fmt.Sprintf("Quanto é %d + %d?", a, b)
-
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	payload := fmt.Sprintf("%d:%s:%s", answer, ts, campaignID)
+	payload := fmt.Sprintf("%s:%s", ts, campaignID)
 	sig := computeHMAC(payload, captchaSecret(accessKey))
 	token := base64.RawURLEncoding.EncodeToString([]byte(payload + ":" + sig))
 
-	return CaptchaChallenge{Question: question, Token: token}
+	return CaptchaChallenge{Token: token}
 }
 
-// VerifyCaptcha valida a resposta do usuário contra o token.
-// Retorna true se a resposta é correta e o token não expirou.
+// VerifyCaptcha valida o clique contra o token. userAnswer é ignorado — mantido
+// na assinatura por compatibilidade com o handler (forms antigos enviam "answer").
+// Retorna true se o token é válido, não expirou e já passou o delay mínimo.
 func VerifyCaptcha(token, userAnswer, campaignID, accessKey string) bool {
 	raw, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil {
 		return false
 	}
-	parts := strings.SplitN(string(raw), ":", 4)
-	if len(parts) != 4 {
+	parts := strings.SplitN(string(raw), ":", 3)
+	if len(parts) != 3 {
 		return false
 	}
-	storedAnswer, ts, storedCampaignID, storedSig := parts[0], parts[1], parts[2], parts[3]
+	ts, storedCampaignID, storedSig := parts[0], parts[1], parts[2]
 
 	// Verifica campanha
 	if storedCampaignID != campaignID {
 		return false
 	}
 
-	// Verifica TTL
+	// Verifica TTL + delay mínimo (clique instantâneo = suspeito)
 	tsInt, err := strconv.ParseInt(ts, 10, 64)
-	if err != nil || time.Since(time.Unix(tsInt, 0)) > captchaTTL {
+	if err != nil {
+		return false
+	}
+	elapsed := time.Since(time.Unix(tsInt, 0))
+	if elapsed > captchaTTL || elapsed < captchaMinDelay {
 		return false
 	}
 
 	// Verifica HMAC
-	payload := fmt.Sprintf("%s:%s:%s", storedAnswer, ts, storedCampaignID)
+	payload := fmt.Sprintf("%s:%s", ts, storedCampaignID)
 	expectedSig := computeHMAC(payload, captchaSecret(accessKey))
-	if !hmac.Equal([]byte(storedSig), []byte(expectedSig)) {
-		return false
-	}
-
-	// Verifica resposta do usuário
-	userInt, err := strconv.Atoi(strings.TrimSpace(userAnswer))
-	if err != nil {
-		return false
-	}
-	storedInt, err := strconv.Atoi(storedAnswer)
-	if err != nil {
-		return false
-	}
-	return userInt == storedInt
+	return hmac.Equal([]byte(storedSig), []byte(expectedSig))
 }
 
 func computeHMAC(payload, secret string) string {

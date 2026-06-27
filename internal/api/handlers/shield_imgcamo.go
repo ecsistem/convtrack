@@ -1,13 +1,51 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"math/rand/v2"
+	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/ecsistem/convtrack/internal/api/middleware"
 	"github.com/ecsistem/convtrack/internal/shield"
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 )
+
+// imgCamoDir retorna o diretório de armazenamento dos criativos camuflados
+// (configurável via IMGCAMO_DIR, mesmo padrão do VIDEOCAMO_DIR).
+func imgCamoDir() string {
+	if d := os.Getenv("IMGCAMO_DIR"); d != "" {
+		return d
+	}
+	return filepath.Join(os.TempDir(), "imgcamo_log")
+}
+
+// saveImgCamoLog persiste o criativo camuflado em disco + metadados no banco,
+// para o admin poder visualizar depois. Best-effort: falha aqui nunca impede
+// a resposta ao usuário (a imagem já foi processada e vai ser entregue).
+func (h *ShieldHandler) saveImgCamoLog(projectID uuid.UUID, filename, technique string, epsilon int, mime string, data []byte) {
+	dir := imgCamoDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return
+	}
+	ext := ".png"
+	if strings.Contains(mime, "jpeg") || strings.Contains(mime, "jpg") {
+		ext = ".jpg"
+	}
+	storedName := uuid.New().String() + ext
+	storagePath := filepath.Join(dir, storedName)
+	if err := os.WriteFile(storagePath, data, 0644); err != nil {
+		return
+	}
+	_, _ = h.db.Exec(context.Background(), `
+		INSERT INTO imgcamo_log (project_id, filename, technique, epsilon, mime_type, size_bytes, storage_path)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		projectID, filename, technique, epsilon, mime, len(data), storagePath,
+	)
+}
 
 // CamouflageImage godoc
 //
@@ -167,6 +205,11 @@ func (h *ShieldHandler) CamouflageImage(c *fiber.Ctx) error {
 	c.Set("X-Image-Height", fmt.Sprintf("%d", result.OrigHeight))
 	c.Set("Access-Control-Expose-Headers",
 		"X-Camo-Epsilon,X-Camo-MaxDelta,X-Camo-MeanDelta,X-Camo-PSNR,X-Camo-Technique,X-Camo-Opacity,X-Image-Width,X-Image-Height")
+
+	// Salva no histórico (best-effort) para o admin poder ver os criativos depois.
+	if project := middleware.GetProject(c); project != nil {
+		go h.saveImgCamoLog(project.ID, fh.Filename, string(tech), eps, result.MimeType, result.ImageData)
+	}
 
 	return c.Send(result.ImageData)
 }

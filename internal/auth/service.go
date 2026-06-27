@@ -30,9 +30,9 @@ const (
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 var (
-	ErrEmailTaken       = errors.New("email already registered")
-	ErrInvalidCreds     = errors.New("invalid email or password")
-	ErrInvalidToken     = errors.New("invalid or expired token")
+	ErrEmailTaken   = errors.New("email already registered")
+	ErrInvalidCreds = errors.New("invalid email or password")
+	ErrInvalidToken = errors.New("invalid or expired token")
 )
 
 // ─── Claims ───────────────────────────────────────────────────────────────────
@@ -184,6 +184,35 @@ func (s *Service) Login(ctx context.Context, email, password string) (*LoginResu
 		return nil, err
 	}
 
+	return &LoginResult{Account: &account, AccessToken: access, RefreshToken: refresh}, nil
+}
+
+// ─── Impersonate (admin "acessar painel do cliente") ───────────────────────────
+
+// ImpersonateAccount gera um par de tokens válido para a conta alvo, sem
+// senha — usado pelo admin para entrar no painel de qualquer cliente.
+// Não passa pelas checagens de status (suspensa/pendente): o admin precisa
+// conseguir inspecionar a conta mesmo se ela estiver bloqueada.
+func (s *Service) ImpersonateAccount(ctx context.Context, accountID uuid.UUID) (*LoginResult, error) {
+	var account models.Account
+	err := s.db.QueryRow(ctx, `
+		SELECT id, name, email, plan, sessions_quota, is_admin, is_manager, is_affiliate, status, email_verified, created_at
+		FROM accounts WHERE id = $1`, accountID,
+	).Scan(
+		&account.ID, &account.Name, &account.Email, &account.Plan,
+		&account.SessionsQuota, &account.IsAdmin, &account.IsManager, &account.IsAffiliate, &account.Status, &account.EmailVerified, &account.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errors.New("conta não encontrada")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("impersonate query: %w", err)
+	}
+
+	access, refresh, err := s.issueTokens(ctx, &account)
+	if err != nil {
+		return nil, err
+	}
 	return &LoginResult{Account: &account, AccessToken: access, RefreshToken: refresh}, nil
 }
 

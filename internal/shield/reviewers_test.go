@@ -149,7 +149,7 @@ func TestClickIDParam(t *testing.T) {
 		"facebook": "fbclid",
 		"google":   "gclid",
 		"tiktok":   "ttclid",
-		"kwai":     "clickid",
+		"kwai":     "kwai_click_id",
 		"manual":   "",
 		"":         "",
 	}

@@ -20,12 +20,18 @@ import (
 // GET /:slug — entrada principal do cloaker por slug.
 //
 // Fluxo:
-//  1. require_key → se ?_sk ausente/errado → safe_url
-//  2. Bot check → bots → safe_url
+//  1. require_key → se ?_sk ausente/errado → Página White
+//  2. Bot check → bots → Página White
 //  3. challenge_mode:
-//     - "redirect" (default): redireciona direto para money/safe
-//     - "captcha":  serve página de CAPTCHA; após resolver → money_url
-//     - "both":     CAPTCHA → após resolver → loading page com fingerprint → money_url
+//     - "redirect" (default): redireciona direto para Black/White
+//     - "captcha":  serve CAPTCHA de clique; após confirmar → Página Black
+//     - "both":     CAPTCHA → confirmar → loading page com fingerprint → Página Black
+//     - "iframe":   carrega a Página Black de forma invisível via iframe/JS,
+//                   com checagem extra de fingerprint
+//
+// pagebot: quando configurado (ex: "cloudflare"), todo envio à Página White
+// passa primeiro por um interstitial que segura o tráfego até uma ação do
+// usuário (clique) — finge ser uma checagem de segurança real.
 func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 	slug := c.Params("slug")
 	campaign, err := h.svc.ResolveCampaignBySlug(c.Context(), slug)
@@ -38,13 +44,24 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 	// URL completa da tentativa de acesso (path + query string completos)
 	rawURL := string(c.Request().URI().PathOriginal()) + "?" + string(c.Request().URI().QueryString())
 
+	// servePagebotOrRedirect entrega a Página White — direto, ou atrás do
+	// interstitial Pagebot quando configurado na campanha.
+	servePagebotOrRedirect := func(target string) error {
+		if campaign.Pagebot == "cloudflare" {
+			c.Set("Content-Type", "text/html; charset=utf-8")
+			c.Set("Cache-Control", "no-store")
+			return c.SendString(buildPagebotHTML(target))
+		}
+		return c.Redirect(target, fiber.StatusFound)
+	}
+
 	safeRedirect := func(reason string) error {
 		safeURL := campaign.SafeURL
 		if safeURL == "" {
 			safeURL = "https://google.com"
 		}
 		h.svc.LogFiltered(campaign.ProjectID, ip, ua, reason, safeURL, rawURL)
-		return c.Redirect(safeURL, fiber.StatusFound)
+		return servePagebotOrRedirect(safeURL)
 	}
 
 	// ── 0. Em análise — safe_url para todos ────────────────────────────────
@@ -53,7 +70,12 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 	}
 
 	// ── 0b. Click ID obrigatório (revisor de anúncio abre sem o click pago) ──
-	if campaign.RequireTtclid && c.Query("ttclid") == "" {
+	// Verifica TODAS as ocorrências do parâmetro (não só a primeira) e
+	// rejeita macros de anúncio não resolvidos (ex: __CLICK_ID__) — sinal de
+	// que a URL foi copiada crua de spy tool em vez de clicada de fato.
+	// Spy tools costumam duplicar o parâmetro: o macro original intacto +
+	// um valor forjado, esperando que só o primeiro seja checado.
+	if campaign.RequireTtclid && !hasValidQueryValue(c, "ttclid") {
 		return safeRedirect("no_ttclid")
 	}
 	if campaign.RequireClickID {
@@ -61,7 +83,7 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 		if len(params) > 0 {
 			hasClickID := false
 			for _, param := range params {
-				if c.Query(param) != "" {
+				if hasValidQueryValue(c, param) {
 					hasClickID = true
 					break
 				}
@@ -97,7 +119,7 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 
 	isBot := result != nil && !result.Allowed
 
-	// Bots sempre vão para safe_url — sem CAPTCHA
+	// Bots sempre vão para a Página White — sem CAPTCHA
 	if isBot {
 		safeURL := campaign.SafeURL
 		if result != nil && result.RedirectURL != "" {
@@ -106,7 +128,7 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 		if safeURL == "" {
 			safeURL = "https://google.com"
 		}
-		return c.Redirect(safeURL, fiber.StatusFound)
+		return servePagebotOrRedirect(safeURL)
 	}
 
 	// ── 3. Humano: challenge_mode ───────────────────────────────────────────
@@ -136,12 +158,21 @@ func (h *ShieldHandler) SlugCloak(c *fiber.Ctx) error {
 		cookieName := "ct_cp_" + campaign.ID.String()[:8]
 		cookieVal := c.Cookies(cookieName)
 		if cookieVal == campaign.ID.String()[:16] {
-			// Já resolveu — vai direto para money
+			// Já resolveu — vai direto para a Página Black
 			return c.Redirect(moneyURL, fiber.StatusFound)
 		}
-		// Serve página de CAPTCHA
+		// Serve CAPTCHA de clique
 		ch := shield.GenerateCaptcha(campaign.ID.String(), campaign.AccessKey)
-		html := buildCaptchaHTML(slug, ch.Question, ch.Token, campaign.Name, moneyURL, mode)
+		html := buildCaptchaHTML(slug, ch.Token, campaign.Name, moneyURL, mode)
+		c.Set("Content-Type", "text/html; charset=utf-8")
+		c.Set("Cache-Control", "no-store")
+		return c.SendString(html)
+
+	case "iframe":
+		// Carrega a Página Black de forma invisível via iframe, com checagem
+		// extra de fingerprint embutida na página — útil contra revisores que
+		// olham só o HTML/network superficialmente.
+		html := buildIframeHTML(moneyURL, h.svc.APIBase, campaign.ProjectID.String(), campaign.ID.String())
 		c.Set("Content-Type", "text/html; charset=utf-8")
 		c.Set("Cache-Control", "no-store")
 		return c.SendString(html)
@@ -165,9 +196,9 @@ func (h *ShieldHandler) VerifyCaptcha(c *fiber.Ctx) error {
 	mode   := c.FormValue("mode")   // captcha | both
 
 	if !shield.VerifyCaptcha(token, answer, campaign.ID.String(), campaign.AccessKey) {
-		// Resposta errada → novo desafio com mensagem de erro
+		// Token inválido/expirado/clique instantâneo → novo desafio com erro
 		ch := shield.GenerateCaptcha(campaign.ID.String(), campaign.AccessKey)
-		html := buildCaptchaHTML(slug, ch.Question, ch.Token, campaign.Name, next, mode)
+		html := buildCaptchaHTML(slug, ch.Token, campaign.Name, next, mode)
 		html = strings.Replace(html, `id="captcha-error" class="captcha-error hidden"`,
 			`id="captcha-error" class="captcha-error"`, 1)
 		c.Set("Content-Type", "text/html; charset=utf-8")
@@ -213,8 +244,24 @@ func buildQS(c *fiber.Ctx, exclude ...string) string {
 	return strings.Join(parts, "&")
 }
 
-// buildCaptchaHTML gera a página HTML do CAPTCHA.
-func buildCaptchaHTML(slug, question, token, campaignName, moneyURL, mode string) string {
+// hasValidQueryValue verifica se ALGUMA ocorrência do parâmetro na query
+// string é não-vazia e não é um macro de anúncio não resolvido. Necessário
+// porque c.Query() retorna só a primeira ocorrência — spy tools duplicam o
+// parâmetro (macro original + valor forjado) para furar checagem ingênua.
+func hasValidQueryValue(c *fiber.Ctx, param string) bool {
+	values := c.Request().URI().QueryArgs().PeekMulti(param)
+	for _, v := range values {
+		if !shield.IsUnresolvedMacro(string(v)) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildCaptchaHTML gera a página do CAPTCHA de clique (sem pergunta/conta).
+// O usuário só precisa clicar — o servidor valida token + delay mínimo
+// (VerifyCaptcha) para filtrar replays automatizados que já chegam com token.
+func buildCaptchaHTML(slug, token, campaignName, moneyURL, mode string) string {
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -246,19 +293,19 @@ h1{font-size:18px;font-weight:600;color:#f4f4f5;text-align:center;margin-bottom:
 .sub{font-size:13px;color:#71717a;text-align:center;margin-bottom:32px;line-height:1.5}
 .challenge-box{
   background:#09090b;border:1px solid rgba(255,255,255,.08);border-radius:12px;
-  padding:20px;text-align:center;margin-bottom:24px;
+  padding:24px;text-align:center;margin-bottom:24px;
 }
-.question{font-size:22px;font-weight:700;color:#e4e4e7;letter-spacing:-.3px;margin-bottom:16px}
-input[type=number]{
-  width:100%%;height:48px;border-radius:10px;
-  background:#27272a;border:1.5px solid rgba(255,255,255,.1);
-  color:#f4f4f5;font-size:20px;font-weight:600;text-align:center;
-  outline:none;transition:border .2s;
-  -moz-appearance:textfield;
+.check-row{
+  display:flex;align-items:center;gap:12px;
+  background:#18181b;border:1.5px solid rgba(255,255,255,.1);border-radius:10px;
+  padding:16px;cursor:pointer;transition:border .15s,background .15s;
 }
-input[type=number]::-webkit-outer-spin-button,
-input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
-input[type=number]:focus{border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.2)}
+.check-row:hover{border-color:#6366f1;background:#1c1c20}
+.checkbox{
+  width:22px;height:22px;border-radius:6px;flex-shrink:0;
+  border:1.5px solid rgba(255,255,255,.2);background:#27272a;
+}
+.check-row span{font-size:14px;color:#d4d4d8;font-weight:500;text-align:left}
 button{
   width:100%%;height:48px;border:none;border-radius:10px;cursor:pointer;
   background:linear-gradient(135deg,#4f46e5,#7c3aed);
@@ -267,6 +314,7 @@ button{
 }
 button:hover{opacity:.9}
 button:active{transform:scale(.98)}
+button:disabled{opacity:.5;cursor:not-allowed}
 .captcha-error{
   background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);
   border-radius:8px;padding:10px 14px;text-align:center;
@@ -281,25 +329,142 @@ button:active{transform:scale(.98)}
 <div class="card">
   <div class="shield">🛡️</div>
   <h1>Verificação de Segurança</h1>
-  <p class="sub">Resolva o desafio abaixo para continuar.</p>
+  <p class="sub">Confirme que você é humano para continuar.</p>
 
-  <p id="captcha-error" class="captcha-error hidden">Resposta incorreta. Tente novamente.</p>
+  <p id="captcha-error" class="captcha-error hidden">Verificação falhou. Tente novamente.</p>
 
-  <div class="challenge-box">
-    <p class="question">%s</p>
-    <form method="POST" action="/%s/verify" autocomplete="off">
-      <input type="hidden" name="token" value="%s">
-      <input type="hidden" name="next"  value="%s">
-      <input type="hidden" name="mode"  value="%s">
-      <input type="number" name="answer" placeholder="?" autofocus required inputmode="numeric">
-      <button type="submit">Verificar →</button>
-    </form>
-  </div>
+  <form id="cf" method="POST" action="/%s/verify" autocomplete="off">
+    <input type="hidden" name="token" value="%s">
+    <input type="hidden" name="next"  value="%s">
+    <input type="hidden" name="mode"  value="%s">
+    <input type="hidden" name="answer" value="1">
+    <div class="challenge-box">
+      <label class="check-row" for="human-check">
+        <input type="checkbox" id="human-check" name="checked" required style="display:none" onclick="document.getElementById('submit-btn').disabled=false">
+        <span class="checkbox" id="checkbox-visual"></span>
+        <span>Não sou um robô</span>
+      </label>
+      <button id="submit-btn" type="submit">Continuar →</button>
+    </div>
+  </form>
 
   <p class="footer">Protegido por <span>ConvTrack Shield</span></p>
 </div>
+<script>
+document.getElementById('human-check').addEventListener('change', function(e){
+  document.getElementById('checkbox-visual').style.background = e.target.checked ? '#6366f1' : '#27272a';
+});
+document.querySelector('.check-row').addEventListener('click', function(e){
+  if (e.target.tagName !== 'INPUT') {
+    var cb = document.getElementById('human-check');
+    cb.checked = !cb.checked;
+    cb.dispatchEvent(new Event('change'));
+    document.getElementById('submit-btn').disabled = !cb.checked;
+  }
+});
+</script>
 </body>
-</html>`, question, slug, token, moneyURL, mode)
+</html>`, slug, token, moneyURL, mode)
+}
+
+// buildIframeHTML gera a página do modo "iframe" — carrega a Página Black de
+// forma invisível dentro de um iframe após o script de fingerprinting rodar,
+// reforçando a detecção contra bots avançados que só inspecionam o HTML
+// inicial ou o tráfego de rede superficialmente.
+func buildIframeHTML(moneyURL, apiBase, projectID, campaignID string) string {
+	fpScript := ""
+	if apiBase != "" {
+		fpScript = fmt.Sprintf(`<script src="%s/shield-fp.js?k=%s&c=%s" defer></script>`, apiBase, projectID, campaignID)
+	}
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Carregando...</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%%;overflow:hidden;background:#fff}
+iframe{position:fixed;inset:0;width:100%%;height:100%%;border:none}
+</style>
+%s
+</head>
+<body>
+<script>
+(function(){
+  // Validação adicional de fingerprint (shield-fp.js) já disparou no carregamento
+  // desta página. Pequeno atraso simula o tempo de uma checagem real e evita que
+  // o iframe apareça antes do script de fingerprint terminar de coletar sinais.
+  setTimeout(function(){
+    var f = document.createElement('iframe');
+    f.src = %q;
+    document.body.appendChild(f);
+  }, 250);
+})();
+</script>
+</body>
+</html>`, fpScript, moneyURL)
+}
+
+// buildPagebotHTML gera o interstitial "Pagebot" (estilo Cloudflare) exibido
+// antes da Página White. Segura o tráfego até o usuário clicar — a maioria
+// dos scrapers/scanners automatizados não interage e nunca chega ao destino.
+func buildPagebotHTML(target string) string {
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Verificando seu navegador...</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+body{
+  background:#0e1014;color:#cdd3da;
+  display:flex;align-items:center;justify-content:center;min-height:100%%;
+}
+.card{width:100%%;max-width:460px;margin:24px;text-align:center}
+.spinner{
+  width:36px;height:36px;border-radius:50%%;margin:0 auto 24px;
+  border:3px solid rgba(255,255,255,.08);border-top-color:#f6821f;
+  animation:spin .8s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+h1{font-size:16px;font-weight:500;color:#e4e7eb;margin-bottom:8px}
+.sub{font-size:13px;color:#7c8591;line-height:1.6;margin-bottom:28px}
+.btn-wrap{display:none}
+.btn-wrap.show{display:block}
+button{
+  border:none;border-radius:6px;cursor:pointer;height:42px;padding:0 28px;
+  background:#f6821f;color:#fff;font-size:14px;font-weight:600;
+  transition:opacity .15s;
+}
+button:hover{opacity:.9}
+.footer{margin-top:32px;font-size:11px;color:#4a5057}
+</style>
+</head>
+<body>
+<div class="card">
+  <div id="spinner" class="spinner"></div>
+  <h1 id="status-text">Verificando seu navegador antes de acessar o site.</h1>
+  <p class="sub">Este processo é automático. Seu navegador será redirecionado em breve.</p>
+  <div id="btn-wrap" class="btn-wrap">
+    <button id="continue-btn">Continuar →</button>
+  </div>
+  <p class="footer">Performance &amp; security by Pagebot</p>
+</div>
+<script>
+setTimeout(function(){
+  document.getElementById('spinner').style.display='none';
+  document.getElementById('status-text').textContent='Verificação concluída.';
+  document.getElementById('btn-wrap').className='btn-wrap show';
+}, 1800);
+document.getElementById('continue-btn').addEventListener('click', function(){
+  window.location.replace(%q);
+});
+</script>
+</body>
+</html>`, target)
 }
 
 // buildLoadingHTML gera a página de loading para o modo "both" (pós-CAPTCHA).

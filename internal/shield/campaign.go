@@ -26,20 +26,34 @@ func sanitizeSlug(s string) string {
 	return strings.Trim(s, "-")
 }
 
-// ClickIDParam retorna o nome do parâmetro de click-id esperado para a
-// plataforma. Vazio = plataforma sem click-id padrão.
+// ClickIDParam retorna o nome principal do parâmetro de click-id esperado
+// para a plataforma. Vazio = plataforma sem click-id padrão.
+// Mantido por compatibilidade — para checagem completa use ClickIDParamsFor,
+// que cobre nomes alternativos usados pela mesma plataforma.
 func ClickIDParam(platform string) string {
+	params := ClickIDParamsFor(platform)
+	if len(params) == 0 {
+		return ""
+	}
+	return params[0]
+}
+
+// ClickIDParamsFor retorna todos os nomes de parâmetro de click-id aceitos
+// para a plataforma. Algumas plataformas usam mais de um nome — ex: Kwai usa
+// "kwai_click_id" no parâmetro oficial da URL de tracking, e "clickid" como
+// alias legado em algumas integrações antigas.
+func ClickIDParamsFor(platform string) []string {
 	switch strings.ToLower(platform) {
 	case "meta", "facebook", "instagram":
-		return "fbclid"
+		return []string{"fbclid"}
 	case "google", "youtube":
-		return "gclid"
+		return []string{"gclid"}
 	case "tiktok":
-		return "ttclid"
+		return []string{"ttclid"}
 	case "kwai":
-		return "clickid"
+		return []string{"kwai_click_id", "clickid"}
 	default:
-		return ""
+		return nil
 	}
 }
 
@@ -88,15 +102,40 @@ func (c *Campaign) OriginMatches(referer string) bool {
 	return false
 }
 
+// IsUnresolvedMacro detecta se o valor de um parâmetro de tracking é um
+// macro de anúncio não substituído (ex: __CLICK_ID__, {{ad.id}}, {gclid}).
+// Acontece quando alguém copia a URL crua do criativo (spy tools, scrapers)
+// em vez de clicar de fato no anúncio — a plataforma nunca resolve o macro
+// porque a requisição não passou pelo redirecionador oficial dela.
+func IsUnresolvedMacro(v string) bool {
+	if v == "" {
+		return true
+	}
+	upper := strings.ToUpper(v)
+	if strings.HasPrefix(upper, "__") && strings.HasSuffix(upper, "__") {
+		return true // TikTok/genérico: __CLICK_ID__, __AD_ID__, __CAMPAIGN_ID__
+	}
+	if strings.Contains(v, "{{") || strings.Contains(v, "}}") {
+		return true // Meta: {{ad.id}}, {{campaign.id}}
+	}
+	if strings.HasPrefix(v, "{") && strings.HasSuffix(v, "}") {
+		return true // Google Ads: {lpurl}, {gclid}, {ignore}
+	}
+	return false
+}
+
 // ClickIDParams retorna a lista de parâmetros de click-id aceitos pela
-// campanha (um por plataforma selecionada), sem duplicatas.
+// campanha (todos os nomes válidos das plataformas selecionadas), sem
+// duplicatas.
 func (c *Campaign) ClickIDParams() []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, p := range c.effectivePlatforms() {
-		if param := ClickIDParam(p); param != "" && !seen[param] {
-			seen[param] = true
-			out = append(out, param)
+		for _, param := range ClickIDParamsFor(p) {
+			if param != "" && !seen[param] {
+				seen[param] = true
+				out = append(out, param)
+			}
 		}
 	}
 	return out
@@ -139,6 +178,9 @@ type Campaign struct {
 	RequireTtclid  bool      `json:"require_ttclid"  db:"require_ttclid"`  // legado: exige ?ttclid= (TikTok)
 	RequireClickID bool      `json:"require_clickid" db:"require_clickid"` // exige o click-id da plataforma (fbclid/gclid/ttclid/clickid)
 	OriginOnly     bool      `json:"origin_only"     db:"origin_only"`     // valida a origem real (Referer) e ignora o utm_source
+	// Pagebot: interstitial anti-bot na Página White ("Checking your browser…").
+	// Segura o tráfego até uma ação do usuário antes de liberar a Página White.
+	Pagebot       string    `json:"pagebot"        db:"pagebot"`         // none|cloudflare
 	CreatedAt      time.Time `json:"created_at"      db:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"      db:"updated_at"`
 }
@@ -166,6 +208,9 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 	if c.ChallengeMode == "" {
 		c.ChallengeMode = "redirect"
 	}
+	if c.Pagebot == "" {
+		c.Pagebot = "none"
+	}
 	c.normalizePlatforms()
 
 	const maxAttempts = 6
@@ -176,10 +221,10 @@ func (s *Service) CreateCampaign(ctx context.Context, c *Campaign) (*Campaign, e
 		_, err := s.db.Exec(ctx, `
 			INSERT INTO shield_campaigns
 			  (id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
-			   platform, platforms, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid, origin_only)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+			   platform, platforms, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid, origin_only, pagebot)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
 			c.ID, c.ProjectID, c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
-			c.Platform, c.Platforms, c.ChallengeMode, c.RequireKey, c.AccessKey, c.UnderReview, c.RequireTtclid, c.RequireClickID, c.OriginOnly,
+			c.Platform, c.Platforms, c.ChallengeMode, c.RequireKey, c.AccessKey, c.UnderReview, c.RequireTtclid, c.RequireClickID, c.OriginOnly, c.Pagebot,
 		)
 		if err == nil {
 			c.CreatedAt = time.Now()
@@ -214,7 +259,7 @@ func isUniqueSlugViolation(err error) bool {
 func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Campaign, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
-		       platform, platforms, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid, origin_only,
+		       platform, platforms, challenge_mode, require_key, access_key, under_review, require_ttclid, require_clickid, origin_only, pagebot,
 		       created_at, updated_at
 		FROM shield_campaigns WHERE project_id = $1 ORDER BY created_at DESC`, projectID)
 	if err != nil {
@@ -227,7 +272,7 @@ func (s *Service) ListCampaigns(ctx context.Context, projectID uuid.UUID) ([]Cam
 		var c Campaign
 		if err := rows.Scan(&c.ID, &c.ProjectID, &c.Name, &c.Slug, &c.SafeURL, &c.MoneyURL,
 			&c.SplitPct, &c.Enabled, &c.Platform, &c.Platforms, &c.ChallengeMode,
-			&c.RequireKey, &c.AccessKey, &c.UnderReview, &c.RequireTtclid, &c.RequireClickID, &c.OriginOnly,
+			&c.RequireKey, &c.AccessKey, &c.UnderReview, &c.RequireTtclid, &c.RequireClickID, &c.OriginOnly, &c.Pagebot,
 			&c.CreatedAt, &c.UpdatedAt); err != nil {
 			continue
 		}
@@ -247,16 +292,19 @@ func (s *Service) UpdateCampaign(ctx context.Context, c *Campaign) error {
 	if c.ChallengeMode == "" {
 		c.ChallengeMode = "redirect"
 	}
+	if c.Pagebot == "" {
+		c.Pagebot = "none"
+	}
 	c.normalizePlatforms()
 	_, err := s.db.Exec(ctx, `
 		UPDATE shield_campaigns
 		SET name=$1, slug=$2, safe_url=$3, money_url=$4, split_pct=$5, enabled=$6,
 		    platform=$7, platforms=$8, challenge_mode=$9, require_key=$10, access_key=$11,
-		    under_review=$12, require_ttclid=$13, require_clickid=$14, origin_only=$15, updated_at=NOW()
-		WHERE id=$16 AND project_id=$17`,
+		    under_review=$12, require_ttclid=$13, require_clickid=$14, origin_only=$15, pagebot=$16, updated_at=NOW()
+		WHERE id=$17 AND project_id=$18`,
 		c.Name, c.Slug, c.SafeURL, c.MoneyURL, c.SplitPct, c.Enabled,
 		c.Platform, c.Platforms, c.ChallengeMode, c.RequireKey, c.AccessKey,
-		c.UnderReview, c.RequireTtclid, c.RequireClickID, c.OriginOnly, c.ID, c.ProjectID,
+		c.UnderReview, c.RequireTtclid, c.RequireClickID, c.OriginOnly, c.Pagebot, c.ID, c.ProjectID,
 	)
 	return err
 }
@@ -410,12 +458,12 @@ func (s *Service) ResolveCampaignBySlug(ctx context.Context, slug string) (*Camp
 	err := s.db.QueryRow(ctx, `
 		SELECT id, project_id, name, slug, safe_url, money_url, split_pct, enabled,
 		       platform, platforms, challenge_mode, require_key, access_key,
-		       under_review, require_ttclid, require_clickid, origin_only, created_at, updated_at
+		       under_review, require_ttclid, require_clickid, origin_only, pagebot, created_at, updated_at
 		FROM shield_campaigns
 		WHERE slug = $1 AND enabled = true`, slug,
 	).Scan(&c.ID, &c.ProjectID, &c.Name, &c.Slug, &c.SafeURL, &c.MoneyURL,
 		&c.SplitPct, &c.Enabled, &c.Platform, &c.Platforms, &c.ChallengeMode,
-		&c.RequireKey, &c.AccessKey, &c.UnderReview, &c.RequireTtclid, &c.RequireClickID, &c.OriginOnly,
+		&c.RequireKey, &c.AccessKey, &c.UnderReview, &c.RequireTtclid, &c.RequireClickID, &c.OriginOnly, &c.Pagebot,
 		&c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err

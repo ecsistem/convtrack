@@ -38,17 +38,17 @@ func (s *Service) GetConfig(ctx context.Context, projectID uuid.UUID) (*models.S
 	row := s.db.QueryRow(ctx, `
 		SELECT project_id::text, enabled, block_bots, block_headless, block_spy_tools,
 		       block_vpn, block_datacenter, anti_devtools,
-		       geo_mode, geo_countries, device_filter,
+		       geo_mode, geo_countries, device_filter, os_allowed,
 		       redirect_url, primary_url, fallback_urls, blocked_ips,
 		       block_direct, allowed_sources,
 		       updated_at::text
 		FROM shield_configs WHERE project_id = $1`, projectID)
 
-	var geoCountries, fallbackURLs, blockedIPs, allowedSources []string
+	var geoCountries, fallbackURLs, blockedIPs, allowedSources, osAllowed []string
 	err := row.Scan(
 		&cfg.ProjectID, &cfg.Enabled, &cfg.BlockBots, &cfg.BlockHeadless, &cfg.BlockSpyTools,
 		&cfg.BlockVPN, &cfg.BlockDatacenter, &cfg.AntiDevTools,
-		&cfg.GeoMode, &geoCountries, &cfg.DeviceFilter,
+		&cfg.GeoMode, &geoCountries, &cfg.DeviceFilter, &osAllowed,
 		&cfg.RedirectURL, &cfg.PrimaryURL, &fallbackURLs, &blockedIPs,
 		&cfg.BlockDirect, &allowedSources,
 		&cfg.UpdatedAt,
@@ -70,6 +70,7 @@ func (s *Service) GetConfig(ctx context.Context, projectID uuid.UUID) (*models.S
 		cfg.FallbackURLs = []string{}
 		cfg.BlockedIPs = []string{}
 		cfg.AllowedSources = []string{}
+		cfg.OSAllowed = []string{}
 		return cfg, nil
 	}
 
@@ -77,6 +78,7 @@ func (s *Service) GetConfig(ctx context.Context, projectID uuid.UUID) (*models.S
 	cfg.FallbackURLs = fallbackURLs
 	cfg.BlockedIPs = blockedIPs
 	cfg.AllowedSources = allowedSources
+	cfg.OSAllowed = osAllowed
 	return cfg, nil
 }
 
@@ -86,10 +88,10 @@ func (s *Service) UpsertConfig(ctx context.Context, projectID uuid.UUID, cfg *mo
 		INSERT INTO shield_configs (
 			project_id, enabled, block_bots, block_headless, block_spy_tools,
 			block_vpn, block_datacenter, anti_devtools,
-			geo_mode, geo_countries, device_filter,
+			geo_mode, geo_countries, device_filter, os_allowed,
 			redirect_url, primary_url, fallback_urls, blocked_ips,
 			block_direct, allowed_sources, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW())
 		ON CONFLICT (project_id) DO UPDATE SET
 			enabled          = EXCLUDED.enabled,
 			block_bots       = EXCLUDED.block_bots,
@@ -101,6 +103,7 @@ func (s *Service) UpsertConfig(ctx context.Context, projectID uuid.UUID, cfg *mo
 			geo_mode         = EXCLUDED.geo_mode,
 			geo_countries    = EXCLUDED.geo_countries,
 			device_filter    = EXCLUDED.device_filter,
+			os_allowed       = EXCLUDED.os_allowed,
 			redirect_url     = EXCLUDED.redirect_url,
 			primary_url      = EXCLUDED.primary_url,
 			fallback_urls    = EXCLUDED.fallback_urls,
@@ -111,7 +114,7 @@ func (s *Service) UpsertConfig(ctx context.Context, projectID uuid.UUID, cfg *mo
 		projectID,
 		cfg.Enabled, cfg.BlockBots, cfg.BlockHeadless, cfg.BlockSpyTools,
 		cfg.BlockVPN, cfg.BlockDatacenter, cfg.AntiDevTools,
-		cfg.GeoMode, cfg.GeoCountries, cfg.DeviceFilter,
+		cfg.GeoMode, cfg.GeoCountries, cfg.DeviceFilter, cfg.OSAllowed,
 		cfg.RedirectURL, cfg.PrimaryURL, cfg.FallbackURLs, cfg.BlockedIPs,
 		cfg.BlockDirect, cfg.AllowedSources,
 	)
@@ -296,6 +299,25 @@ func (s *Service) Check(ctx context.Context, projectID uuid.UUID, req CheckReque
 		}
 		if cfg.DeviceFilter == "desktop" && dev == "mobile" {
 			return s.block(ctx, projectID, cfg, req, "device"), nil
+		}
+	}
+
+	// ── Sistema operacional (allowlist) ─────────────────────────────────
+	// Vazio = sem restrição. Quando configurado, só os SOs selecionados passam
+	// (ex: permitir iOS + Android, bloquear Windows/macOS — ou vice-versa).
+	if len(cfg.OSAllowed) > 0 {
+		os := osFromUA(ua)
+		osAllowed := false
+		for _, allowed := range cfg.OSAllowed {
+			if strings.EqualFold(allowed, os) {
+				osAllowed = true
+				break
+			}
+		}
+		if !osAllowed {
+			result := s.block(ctx, projectID, cfg, req, "os_blocked")
+			result.Reason = fmt.Sprintf("os_blocked:%s", os)
+			return result, nil
 		}
 	}
 
