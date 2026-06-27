@@ -339,28 +339,31 @@ button:disabled{opacity:.5;cursor:not-allowed}
     <input type="hidden" name="mode"  value="%s">
     <input type="hidden" name="answer" value="1">
     <div class="challenge-box">
-      <label class="check-row" for="human-check">
-        <input type="checkbox" id="human-check" name="checked" required style="display:none" onclick="document.getElementById('submit-btn').disabled=false">
+      <div class="check-row" id="check-row" role="checkbox" aria-checked="false" tabindex="0">
+        <input type="checkbox" id="human-check" name="checked" required style="position:absolute;opacity:0;pointer-events:none">
         <span class="checkbox" id="checkbox-visual"></span>
         <span>Não sou um robô</span>
-      </label>
-      <button id="submit-btn" type="submit">Continuar →</button>
+      </div>
+      <button id="submit-btn" type="submit" disabled>Continuar →</button>
     </div>
   </form>
 
   <p class="footer">Protegido por <span>ConvTrack Shield</span></p>
 </div>
 <script>
-document.getElementById('human-check').addEventListener('change', function(e){
-  document.getElementById('checkbox-visual').style.background = e.target.checked ? '#6366f1' : '#27272a';
-});
-document.querySelector('.check-row').addEventListener('click', function(e){
-  if (e.target.tagName !== 'INPUT') {
-    var cb = document.getElementById('human-check');
-    cb.checked = !cb.checked;
-    cb.dispatchEvent(new Event('change'));
-    document.getElementById('submit-btn').disabled = !cb.checked;
-  }
+// Sem <label for=...> — evita o navegador disparar um clique nativo extra no
+// input (que somado a este handler alternava o estado duas vezes por clique
+// e cancelava a marcação visualmente).
+function toggleHumanCheck(){
+  var cb = document.getElementById('human-check');
+  cb.checked = !cb.checked;
+  document.getElementById('checkbox-visual').style.background = cb.checked ? '#6366f1' : '#27272a';
+  document.getElementById('check-row').setAttribute('aria-checked', String(cb.checked));
+  document.getElementById('submit-btn').disabled = !cb.checked;
+}
+document.getElementById('check-row').addEventListener('click', toggleHumanCheck);
+document.getElementById('check-row').addEventListener('keydown', function(e){
+  if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggleHumanCheck(); }
 });
 </script>
 </body>
